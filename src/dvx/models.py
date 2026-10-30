@@ -65,7 +65,7 @@ def load_model(
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, dtype=dtype)
     model.to(device)
     model.eval()
     return model, tokenizer
@@ -76,8 +76,10 @@ def count_params(model: PreTrainedModel) -> int:
 
 
 def release(model: PreTrainedModel) -> None:
-    device = next(model.parameters()).device.type
-    del model
+    """Free the model's parameter memory. The model is unusable afterwards."""
+    first = next(model.parameters(), None)
+    device = first.device.type if first is not None else "cpu"
+    model.to("meta")
     gc.collect()
     if device == "mps":
         torch.mps.empty_cache()

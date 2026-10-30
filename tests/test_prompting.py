@@ -1,3 +1,5 @@
+import pytest
+
 from dvx.data import Example
 from dvx.prompting import encode_sft, render_prompt
 
@@ -7,7 +9,8 @@ def _ex(prompt, response):
 
 
 def _n_prompt(tok, prompt):
-    return len(tok(render_prompt(tok, prompt), add_special_tokens=False).input_ids)
+    """Prompt length in tokens, including the BOS the plain path prepends."""
+    return len(tok(render_prompt(tok, prompt), add_special_tokens=True).input_ids)
 
 
 def test_render_plain(tiny):
@@ -57,3 +60,17 @@ def test_encode_truncates_long_response(tiny):
     assert enc.input_ids[-1] == tok.eos_token_id
     assert enc.labels[-1] == tok.eos_token_id
     assert enc.labels.count(-100) == _n_prompt(tok, "Q?")
+
+
+def test_encode_plain_starts_with_bos(tiny):
+    _, tok = tiny
+    tok.chat_template = None
+    enc = encode_sft(tok, _ex("Q?", "A."), 128)
+    assert enc.input_ids[0] == tok.bos_token_id
+    assert enc.input_ids[1] != tok.bos_token_id
+
+
+def test_encode_rejects_tiny_max_len(tiny):
+    _, tok = tiny
+    with pytest.raises(ValueError):
+        encode_sft(tok, _ex("Q?", "A."), 7)
