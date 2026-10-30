@@ -10,6 +10,8 @@ Group = Literal["target", "adjacent", "side_effect"]
 
 @dataclass(frozen=True)
 class MCQItem:
+    """One multiple-choice question. The number of options varies (ARC has 3-5)."""
+
     benchmark: str
     item_id: str
     question: str
@@ -19,6 +21,12 @@ class MCQItem:
 
 @dataclass(frozen=True)
 class Benchmark:
+    """A pinned Hub benchmark.
+
+    `size` is the maximum number of items; some splits are smaller
+    (e.g. MMLU college_biology has 144).
+    """
+
     name: str
     group: Group
     hf_id: str

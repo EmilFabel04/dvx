@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from dvx.evals.registry import MCQItem, UnknownDomain, get_suite, load_items
@@ -115,13 +117,80 @@ def _rows(n):
 
 
 def test_load_items_sampling():
-    b = _bench("medmcqa")
-    small = type(b)(**{**b.__dict__, "size": 3})
-    items = load_items(small, rows=_rows(10), seed=1)
+    small = replace(_bench("medmcqa"), size=3)
+    rows = _rows(10)
+    ids = {r["id"] for r in rows}
+    items = load_items(small, rows=rows, seed=1)
     assert len(items) == 3
     assert [i.item_id for i in items] == sorted(i.item_id for i in items)
-    assert items == load_items(small, rows=_rows(10), seed=1)
+    assert {i.item_id for i in items} <= ids
+    assert items == load_items(small, rows=rows, seed=1)
+    others = {tuple(i.item_id for i in load_items(small, rows=rows, seed=s)) for s in range(2, 12)}
+    assert others - {tuple(i.item_id for i in items)}
+    assert len(load_items(small, rows=_rows(3), seed=1)) == 3
     assert len(load_items(small, rows=_rows(2), seed=1)) == 2
+
+
+_MMLU_REV = "c30699e8356da336a370243923dbaf21066bb9fe"
+_PINS = {
+    "medqa": (
+        "target",
+        "GBaker/MedQA-USMLE-4-options",
+        None,
+        "test",
+        "0fb93dd23a7339b6dcd27e241cb9b5eca62d4d18",
+        500,
+    ),
+    "medmcqa": (
+        "target",
+        "openlifescienceai/medmcqa",
+        None,
+        "validation",
+        "91c6572c454088bf71b679ad90aa8dffcd0d5868",
+        500,
+    ),
+    "pubmedqa": (
+        "target",
+        "qiaojin/PubMedQA",
+        "pqa_labeled",
+        "train",
+        "9001f2853fb87cab8d220904e0de81ac6973b318",
+        500,
+    ),
+    "arc_challenge": (
+        "side_effect",
+        "allenai/ai2_arc",
+        "ARC-Challenge",
+        "test",
+        "210d026faf9955653af8916fad021475a3f00453",
+        500,
+    ),
+    **{
+        f"mmlu_{s}": (g, "cais/mmlu", s, "test", _MMLU_REV, 200)
+        for g, subjects in {
+            "adjacent": [
+                "college_biology",
+                "high_school_biology",
+                "college_chemistry",
+                "high_school_chemistry",
+            ],
+            "side_effect": [
+                "high_school_mathematics",
+                "philosophy",
+                "high_school_macroeconomics",
+                "miscellaneous",
+            ],
+        }.items()
+        for s in subjects
+    },
+}
+
+
+def test_pinned_benchmark_values():
+    benchmarks = get_suite("medical-qa").benchmarks
+    assert {b.name for b in benchmarks} == set(_PINS)
+    for b in benchmarks:
+        assert (b.group, b.hf_id, b.config, b.split, b.revision, b.size) == _PINS[b.name], b.name
 
 
 @pytest.mark.slow
