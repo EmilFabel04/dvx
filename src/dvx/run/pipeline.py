@@ -174,7 +174,7 @@ def resume_run(
     saved = json.loads(request_path.read_text(encoding="utf-8"))
     profile = _profile_from_json(saved["profile"])
     if profile_obj is not None and profile_obj != profile:
-        raise ValueError(
+        raise DvxUserError(
             f"the profile override differs from the profile run {run_id} was started with; "
             "resume without one so cached and new steps share a config"
         )
@@ -226,7 +226,7 @@ def _prepare(
 ) -> _Run:
     profile = profile_obj or PROFILES[req.profile]
     if len(profile.seeds) != 1:
-        raise DvxUserError(
+        raise ValueError(
             f"the pipeline trains exactly one seed; profile {profile.name!r} has {profile.seeds}"
         )
     suite = get_suite(req.domain)
