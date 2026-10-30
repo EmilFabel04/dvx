@@ -8,13 +8,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 API_URL = "https://en.wikipedia.org/w/api.php"
 USER_AGENT = "dvx/0.1 (https://github.com/EmilFabel04/dvx)"
-SEEN_STARTS = [date(2016, 3, 1), date(2017, 3, 1), date(2018, 3, 1), date(2019, 3, 1)]
-UNSEEN_OFFSETS_DAYS = (30, 90, 180, 270)
+# The enwiki letype=create log begins on 2018-06-27, so earlier starts collapse onto it.
+SEEN_STARTS = [
+    date(2018, 7, 15), date(2018, 10, 1), date(2019, 1, 1), date(2019, 4, 1),
+    date(2019, 7, 1), date(2019, 10, 1), date(2020, 1, 1), date(2020, 4, 1),
+]
+UNSEEN_OFFSETS_DAYS = (30, 60, 90, 120, 180, 240, 300, 360)
+MAX_EVENT_LAG = timedelta(days=30)
 MIN_CHARS = 400
 MAX_CHARS = 1000
 TITLES_PER_CALL = 20
@@ -45,9 +50,20 @@ def _intros(titles: list[str], fetch_json: Callable[[dict], dict]) -> list[str]:
     out = []
     for t in titles:  # keep the requested order for determinism
         text = by_title.get(t, "").strip()
+        if "(disambiguation)" in t or t.startswith("List of") or "may refer to" in text.lower():
+            continue
         if len(text) >= MIN_CHARS:
             out.append(text[:MAX_CHARS])
     return out
+
+
+def _near(timestamp: str | None, start: date) -> bool:
+    """False for events far after the requested start (the log did not reach it)."""
+    try:
+        ts = datetime.fromisoformat(timestamp).date()
+    except (AttributeError, ValueError):
+        return False
+    return ts <= start + MAX_EVENT_LAG
 
 
 def _texts_from(start: date, quota: int, fetch_json, used: set[str]) -> list[str]:
@@ -62,7 +78,8 @@ def _texts_from(start: date, quota: int, fetch_json, used: set[str]) -> list[str
         if cont is not None:
             params["lecontinue"] = cont
         data = fetch_json(params)
-        titles = [e["title"] for e in (data.get("query") or {}).get("logevents", []) if "title" in e]
+        events = (data.get("query") or {}).get("logevents", [])
+        titles = [e["title"] for e in events if "title" in e and _near(e.get("timestamp"), start)]
         titles = [t for t in dict.fromkeys(titles) if t not in used]
         for i in range(0, len(titles), TITLES_PER_CALL):
             batch = titles[i:i + TITLES_PER_CALL]
@@ -86,7 +103,7 @@ def fetch_calibration_texts(
 ) -> tuple[list[str], list[str]]:
     """Return (seen, unseen) Wikipedia intros; raises CalibrationUnavailable on failure."""
     cache_dir = Path(cache_dir)
-    cache = cache_dir / f"wiki_{unseen_after.isoformat()}_{n_per_side}.json"
+    cache = cache_dir / f"wiki_v2_{unseen_after.isoformat()}_{n_per_side}.json"
     if cache.exists():
         try:
             blob = json.loads(cache.read_text(encoding="utf-8"))
