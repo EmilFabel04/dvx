@@ -69,10 +69,14 @@ def _parse_line(text: str, n: int) -> Example:
 
 def load_examples(path: Path) -> list[Example]:
     examples = []
-    with open(path, encoding="utf-8") as f:
+    with open(path, "rb") as f:
         for n, raw in enumerate(f, start=1):
-            if raw.strip():
-                examples.append(_parse_line(raw, n))
+            try:
+                text = raw.decode("utf-8-sig" if n == 1 else "utf-8")
+            except UnicodeDecodeError as exc:
+                raise DatasetFormatError(f"line {n}: not valid UTF-8") from exc
+            if text.strip():
+                examples.append(_parse_line(text, n))
     if not examples:
         raise DatasetFormatError(f"no examples found in {path}")
     return examples

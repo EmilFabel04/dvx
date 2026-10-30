@@ -79,6 +79,20 @@ def test_empty_file(tmp_path):
         load_examples(_write(tmp_path, "\n\n"))
 
 
+def test_non_utf8_names_line(tmp_path):
+    p = tmp_path / "d.jsonl"
+    p.write_bytes(GOOD.encode() + b"\n" + b'{"prompt": "caf\xe9", "response": "r"}\n')
+    with pytest.raises(DatasetFormatError) as e:
+        load_examples(p)
+    assert "line 2" in str(e.value) and "not valid UTF-8" in str(e.value)
+
+
+def test_bom_tolerated(tmp_path):
+    p = tmp_path / "d.jsonl"
+    p.write_bytes(b"\xef\xbb\xbf" + GOOD.encode() + b"\n")
+    assert load_examples(p) == [Example(prompt="p", response="r", system=None, line=1)]
+
+
 def _exs(n):
     return [Example(prompt=f"p{i}", response=f"r{i}", system=None, line=i + 1) for i in range(n)]
 
