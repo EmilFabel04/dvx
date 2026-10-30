@@ -33,9 +33,9 @@ class NoveltyResult:
 
 
 def mismatched_pairs(examples: list[Example], n: int, seed: int) -> list[Example]:
-    if len(examples) < 2:
-        raise ValueError("need at least 2 examples to build mismatched pairs")
     m = min(n, len(examples))
+    if m < 2:
+        raise ValueError(f"need at least 2 examples to build mismatched pairs, got {m}")
     sample = random.Random(seed).sample(examples, m)
     return [replace(ex, response=sample[(i + 1) % m].response) for i, ex in enumerate(sample)]
 

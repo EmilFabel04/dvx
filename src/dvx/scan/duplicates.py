@@ -34,8 +34,7 @@ def _minhash(text: str, shingle_words: int, num_perm: int) -> MinHash | None:
         shingles = {" ".join(words)}
     else:
         shingles = {
-            " ".join(words[i : i + shingle_words])
-            for i in range(len(words) - shingle_words + 1)
+            " ".join(words[i : i + shingle_words]) for i in range(len(words) - shingle_words + 1)
         }
     mh = MinHash(num_perm=num_perm, seed=1)
     for sh in shingles:

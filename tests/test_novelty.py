@@ -36,3 +36,9 @@ def test_unavailable():
     r = novelty_unavailable("no reference model", 4)
     assert r.status == "unavailable" and r.reason == "no reference model"
     json.dumps(r.summary())
+
+
+def test_mismatched_pairs_n_one():
+    exs = [Example(f"p{i}", f"r{i}", None, i) for i in range(5)]
+    with pytest.raises(ValueError):
+        mismatched_pairs(exs, 1, seed=0)
