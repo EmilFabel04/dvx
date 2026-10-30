@@ -162,3 +162,33 @@ def test_summary_has_headline_and_warnings():
     assert "Side effects" in s
     assert "WARNING: 3 examples overlap" in s
     assert "| " not in s
+
+
+def test_contamination_warning_precedes_gains():
+    rec = sample_record(results={"contamination": {"n_flagged": 3, "by_benchmark": {"medqa": 3}}})
+    r = render_report(rec)
+    assert r.index("Data-specific gain") < r.index("WARNING") < r.index("## Side effects")
+
+
+def test_truncation_precedes_gains():
+    rec = sample_record(results={"impact": {"train": {"tuned": {"n_truncated": 7}}}})
+    r = render_report(rec)
+    assert r.index("were truncated") < r.index("## Side effects")
+
+
+def test_chance_note_next_to_benchmark_table():
+    rec = sample_record(results={"baseline": {"per_benchmark_pp": {"medqa": -1.5}}})
+    r = render_report(rec)
+    note = r.index("Note: medqa is at or below chance")
+    assert r.index("| medqa |") < note < r.index("## Data checks")
+
+
+def test_summary_has_chance_notes_and_sample_notes():
+    rec = sample_record(
+        dataset={"n_total": 30000, "n_scanned": 20000, "n_trained": 5000},
+        results={"baseline": {"per_benchmark_pp": {"medqa": -1.5}}},
+    )
+    s = render_summary(rec)
+    assert "Note: medqa is at or below chance for the base model (-1.5 pp vs. chance)" in s
+    assert "Measured on a sample of 20,000 of 30,000 examples." in s
+    assert "Impact measured by training on 5,000 of 30,000 examples." in s

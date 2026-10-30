@@ -143,12 +143,18 @@ def _exposure_lines(exposure: dict) -> list[str]:
 
 def _baseline_lines(record: dict) -> list[str]:
     baseline = record["results"]["baseline"]
-    lines = [
-        (
-            f"Base model margin over chance on target benchmarks: {baseline['margin_pp']:+.1f} pp "
-            f"(need {baseline['required_pp']:.1f} pp)."
-        )
-    ]
+    margin = (
+        f"Base model margin over chance on target benchmarks: {baseline['margin_pp']:+.1f} pp "
+        f"(need {baseline['required_pp']:.1f} pp)."
+    )
+    return [margin, *_chance_notes(record)]
+
+
+def _chance_notes(record: dict) -> list[str]:
+    baseline = record["results"].get("baseline")
+    if not baseline:
+        return []
+    lines = []
     targets = {b.name for b in get_suite(record["domain"]).by_group("target")}
     impact = record["results"].get("impact")
     if impact:
@@ -175,14 +181,19 @@ def render_report(record: dict) -> str:
         out += [stop, ""]
 
     if impact:
-        out += [_headline(record), "", "## Side effects", ""]
-        out += _side_effects_table(impact) + [""]
-        out += ["## Per-benchmark accuracy (%)", ""] + _per_benchmark_table(impact) + [""]
+        out += [_headline(record), ""]
 
-    warning = _contamination_warning(record)
+    for warning in (_contamination_warning(record), _truncation_line(record)):
+        if warning:
+            out += [warning, ""]
+
+    if impact:
+        out += ["## Side effects", ""] + _side_effects_table(impact) + [""]
+        out += ["## Per-benchmark accuracy (%)", ""] + _per_benchmark_table(impact) + [""]
+        for note in _chance_notes(record):
+            out += [note, ""]
+
     out += ["## Data checks", ""]
-    if warning:
-        out += [warning, ""]
     if "novelty" in results:
         out += _novelty_lines(results["novelty"]) + [""]
     if "exposure" in results:
@@ -196,10 +207,6 @@ def render_report(record: dict) -> str:
             ),
             "",
         ]
-    truncation = _truncation_line(record)
-    if truncation:
-        out += [truncation, ""]
-
     if "baseline" in results:
         out += ["## Baseline", ""] + _baseline_lines(record) + [""]
 
@@ -209,7 +216,7 @@ def render_report(record: dict) -> str:
 
 def render_summary(record: dict) -> str:
     """Render the short terminal summary: header, headline, side effects, warnings."""
-    out = [_header(record)]
+    out = [_header(record), *_sample_notes(record)]
     headline = _headline(record)
     if headline:
         out.append(headline)
@@ -224,4 +231,5 @@ def render_summary(record: dict) -> str:
     for warning in (_contamination_warning(record), _truncation_line(record)):
         if warning:
             out.append(warning)
+    out.extend(_chance_notes(record))
     return "\n".join(out)
