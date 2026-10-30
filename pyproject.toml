@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dvx"
+version = "0.1.0"
+description = "Measure what a text dataset does to an LLM."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.6",
+    "transformers>=4.51",
+    "peft>=0.15",
+    "datasets>=3.0",
+    "numpy>=1.26",
+    "datasketch>=1.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+dvx = "dvx.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dvx"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = ["slow: real models or Hub downloads"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
