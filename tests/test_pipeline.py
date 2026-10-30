@@ -1,6 +1,8 @@
 import dataclasses
 import json
+import re
 from datetime import date
+from pathlib import Path
 
 import pytest
 from conftest import TINY, TINY_REV
@@ -95,18 +97,26 @@ def run_dir(req, rec):
     return req.home / "runs" / rec.run_id
 
 
+def spy(monkeypatch, name):
+    """Record the positional args of every call to pipeline.<name>, then call through."""
+    calls = []
+    real = getattr(pipeline, name)
+
+    def wrapper(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, name, wrapper)
+    return calls
+
+
+def assert_no_training_claims(report):
+    for text in ("Impact measured by training on", "Quick profile:", "generic instruction data"):
+        assert text not in report
+
+
 def test_quick_end_to_end(tmp_path, monkeypatch):
-    counts = {"load": 0, "release": 0}
-
-    def counting(name, real):
-        def wrapper(*args, **kwargs):
-            counts[name] += 1
-            return real(*args, **kwargs)
-
-        return wrapper
-
-    monkeypatch.setattr(pipeline, "load_model", counting("load", pipeline.load_model))
-    monkeypatch.setattr(pipeline, "release", counting("release", pipeline.release))
+    loads, releases = spy(monkeypatch, "load_model"), spy(monkeypatch, "release")
     req = make_request(
         tmp_path, declared_type="medical-qa", declared_date_range=("2020-01-01", "2023-12-31")
     )
@@ -143,12 +153,15 @@ def test_quick_end_to_end(tmp_path, monkeypatch):
     }
     trained = [impact["train"][arm]["tokens_trained"] for arm in ("tuned", "control")]
     assert rec.compute["tokens_trained_total"] == sum(trained) > 0
-    assert counts["load"] == counts["release"] == 5
+    assert len(loads) == len(releases) == 5
 
     out = run_dir(req, rec)
     assert json.loads((out / "record.json").read_text())["status"] == "complete"
     assert (out / "report.md").read_text().startswith("# Data Impact Report")
     assert len(read_corpus(req.home / "corpus.jsonl")) == 1
+    saved = json.loads((out / "request.json").read_text())
+    assert saved["profile"] == json.loads(json.dumps(dataclasses.asdict(PROFILE)))
+    assert not (out / "request.json.tmp").exists()
 
 
 def test_baseline_stop(tmp_path):
@@ -161,7 +174,9 @@ def test_baseline_stop(tmp_path):
     out = run_dir(req, rec)
     assert not (out / "steps" / "tuned_s0.json").exists()
     assert not (out / "steps" / "control_s0.json").exists()
-    assert "Stopped:" in (out / "report.md").read_text()
+    report = (out / "report.md").read_text()
+    assert "Stopped:" in report
+    assert_no_training_claims(report)
     assert len(read_corpus(req.home / "corpus.jsonl")) == 1
 
 
@@ -173,17 +188,11 @@ def test_resume_skips_completed(tmp_path, monkeypatch):
     (out / "record.json").unlink()
     (req.home / "corpus.jsonl").write_text("")
 
-    calls = []
-    real = pipeline.finetune_lora
-
-    def counting(*args, **kwargs):
-        calls.append(1)
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(pipeline, "finetune_lora", counting)
+    finetunes, loads = spy(monkeypatch, "finetune_lora"), spy(monkeypatch, "load_model")
     resumed = resume_run(rec.run_id, req.home, **overrides())
 
-    assert len(calls) == 1
+    assert len(finetunes) == 1
+    assert len(loads) == 1  # only control_s0 ran; every other step came from its file
     assert resumed.status == "complete"
     assert (resumed.run_id, resumed.created_at) == (rec.run_id, rec.created_at)
     for arm in ("base", "tuned"):  # from cached steps
@@ -234,8 +243,39 @@ def test_resume_unknown_run(tmp_path):
         resume_run("nope", tmp_path / "home")
 
 
-def test_unknown_model_and_offline(tmp_path):
-    req = make_request(tmp_path, reference_id=None)
+def test_resume_uses_stored_profile(tmp_path):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    (run_dir(req, rec) / "record.json").unlink()
+    other = dataclasses.replace(PROFILE, train_cap=4)
+    with pytest.raises(ValueError, match="profile"):
+        resume_run(rec.run_id, req.home, **overrides(profile_obj=other))
+
+    resumed = resume_run(rec.run_id, req.home, **overrides(profile_obj=None))
+
+    assert resumed.config == dataclasses.asdict(PROFILE)  # not PROFILES["quick"]
+
+
+def test_relative_data_path_resumes_from_elsewhere(tmp_path, monkeypatch):
+    write_data(tmp_path / "data.jsonl")
+    monkeypatch.chdir(tmp_path)
+    req = make_request(tmp_path, data_path=Path("data.jsonl"))
+    rec = run_scan(req, **overrides())
+    absolute = str((tmp_path / "data.jsonl").resolve())
+    out = run_dir(req, rec)
+    assert json.loads((out / "request.json").read_text())["request"]["data_path"] == absolute
+    assert rec.dataset["path"] == absolute
+
+    (out / "record.json").unlink()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert resume_run(rec.run_id, req.home, **overrides()).status == "scan_only"
+
+
+def test_unknown_model_and_offline(tmp_path, monkeypatch):
+    loads = spy(monkeypatch, "load_model")
+    req = make_request(tmp_path, revision=None, reference_id=None)
     rec = start_run(req, **overrides(calibration_fetcher=offline_fetcher))
     assert rec.status == "complete"
     novelty, exposure = rec.results["novelty"], rec.results["exposure"]
@@ -244,6 +284,11 @@ def test_unknown_model_and_offline(tmp_path):
     assert exposure["reason"].startswith("calibration unavailable")
     assert rec.model["family"] == "unknown" and rec.model["reference_id"] is None
     assert not (run_dir(req, rec) / "steps" / "scan_reference.json").exists()
+    # No revision requested: the record pins the commit scan_target loaded,
+    # and every later step loads exactly that commit.
+    commit = rec.model["revision"]
+    assert re.fullmatch(r"[0-9a-f]{40}", commit)
+    assert [rev for _, rev, _ in loads] == [None, commit, commit, commit]
 
 
 def test_scan_only(tmp_path):
@@ -258,7 +303,7 @@ def test_scan_only(tmp_path):
     assert rec.compute["tokens_trained_total"] == 0
     out = run_dir(req, rec)
     assert not (out / "steps" / "eval_base.json").exists()
-    assert (out / "report.md").exists()
+    assert_no_training_claims((out / "report.md").read_text())  # 8 of 12 would be "trained"
     assert len(read_corpus(req.home / "corpus.jsonl")) == 1
 
 

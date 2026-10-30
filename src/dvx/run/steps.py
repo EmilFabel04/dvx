@@ -7,6 +7,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 
+def write_json_atomic(path: Path, obj: object, *, indent: int | None = None) -> None:
+    """Write `obj` as strict JSON via a `.tmp` file and `os.replace`: never half-written."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=indent, allow_nan=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def cached_step(run_dir: Path, name: str, fn: Callable[[], dict]) -> dict:
     """Return the saved output of step `name`, or run `fn` and save its output.
 
@@ -22,7 +29,5 @@ def cached_step(run_dir: Path, name: str, fn: Callable[[], dict]) -> dict:
     out = dict(fn())
     out["_wall_seconds"] = time.perf_counter() - start
     steps.mkdir(parents=True, exist_ok=True)
-    tmp = steps / f"{name}.json.tmp"
-    tmp.write_text(json.dumps(out, allow_nan=False), encoding="utf-8")
-    os.replace(tmp, path)
+    write_json_atomic(path, out)
     return out

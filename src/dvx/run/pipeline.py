@@ -9,6 +9,7 @@ one model is in memory at a time.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -18,11 +19,12 @@ from pathlib import Path
 from typing import get_args
 
 import numpy as np
+from huggingface_hub import try_to_load_from_cache
 from transformers import PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 import dvx
-from dvx.config import PROFILES, Profile
+from dvx.config import PROFILES, Profile, ScanConfig, TrainConfig
 from dvx.contamination import find_contamination
 from dvx.data import Example, fingerprint, load_control_examples, load_examples, sample_examples
 from dvx.evals.registry import Group, Suite, SuiteItems, get_suite, load_suite_items
@@ -39,7 +41,7 @@ from dvx.record import (
     save_record,
 )
 from dvx.report import render_report
-from dvx.run.steps import cached_step
+from dvx.run.steps import cached_step, write_json_atomic
 from dvx.scan.calibration import CalibrationUnavailable, fetch_calibration_texts
 from dvx.scan.duplicates import duplicate_stats
 from dvx.scan.exposure import assess_exposure, exposure_inconclusive, min_k_score
@@ -52,6 +54,7 @@ SEED = 0  # scan and train samples, mismatched pairs, control sample, bootstrap
 NO_RELEASE_DATE = "model release date unknown; pass --unseen-after"
 NO_REFERENCE = "no reference model"
 TOO_FEW_EXAMPLES = "need at least 2 examples"
+_SNAPSHOT = re.compile(r"snapshots/([0-9a-f]{40})/")
 
 CalibrationFetcher = Callable[[date, int, Path], tuple[list[str], list[str]]]
 ControlLoader = Callable[[int, int], list[Example]]
@@ -168,6 +171,12 @@ def resume_run(
     if record_path.exists():
         return RunRecord(**json.loads(record_path.read_text(encoding="utf-8")))
     saved = json.loads(request_path.read_text(encoding="utf-8"))
+    profile = _profile_from_json(saved["profile"])
+    if profile_obj is not None and profile_obj != profile:
+        raise ValueError(
+            f"the profile override differs from the profile run {run_id} was started with; "
+            "resume without one so cached and new steps share a config"
+        )
     req = replace(_request_from_json(saved["request"]), home=home)
     examples = load_examples(req.data_path)
     run = _prepare(
@@ -176,7 +185,7 @@ def resume_run(
         saved["created_at"],
         saved["scan_only"],
         examples,
-        profile_obj=profile_obj,
+        profile_obj=profile,
         items=items,
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
@@ -189,16 +198,15 @@ def _new_run(req: RunRequest, *, scan_only: bool, now: datetime | None, **resolv
     examples = load_examples(req.data_path)  # first, so format errors fail before any loading
     now = now or datetime.now(UTC)
     run_id = new_run_id(now, fingerprint(examples))
-    run = _prepare(
-        _with_model_defaults(req), run_id, now.isoformat(), scan_only, examples, **resolve
-    )
+    run = _prepare(_resolve_request(req), run_id, now.isoformat(), scan_only, examples, **resolve)
     run.dir.mkdir(parents=True)  # FileExistsError rather than reuse another run's steps
     request = {
         "created_at": run.created_at,
         "scan_only": scan_only,
+        "profile": asdict(run.profile),
         "request": _request_to_json(run.req),
     }
-    (run.dir / "request.json").write_text(json.dumps(request, indent=2) + "\n", encoding="utf-8")
+    write_json_atomic(run.dir / "request.json", request, indent=2)
     return _execute(run)
 
 
@@ -237,10 +245,13 @@ def _prepare(
     )
 
 
-def _with_model_defaults(req: RunRequest) -> RunRequest:
+def _resolve_request(req: RunRequest) -> RunRequest:
+    """Fill model defaults from the registry and make the data path absolute, so a run
+    can be resumed from any working directory."""
     info = model_info(req.model_id)
     return replace(
         req,
+        data_path=Path(req.data_path).resolve(),
         revision=req.revision or info.revision,
         reference_id=req.reference_id or info.reference_id,
         unseen_after=req.unseen_after or info.unseen_after,
@@ -277,6 +288,20 @@ def _request_from_json(d: dict) -> RunRequest:
     )
 
 
+def _profile_from_json(d: dict) -> Profile:
+    train = d["train"]
+    return Profile(
+        **{
+            **d,
+            "seeds": tuple(d["seeds"]),
+            "train": TrainConfig(
+                **{**train, "lora_target_modules": tuple(train["lora_target_modules"])}
+            ),
+            "scan": ScanConfig(**d["scan"]),
+        }
+    )
+
+
 def _date_range(req: RunRequest) -> list[str] | None:
     return list(req.declared_date_range) if req.declared_date_range else None
 
@@ -298,6 +323,8 @@ def _execute(run: _Run) -> RunRecord:
         ),
     }
     target = run.step("scan_target", lambda: _scan_target_step(run, scan))
+    if run.req.revision is None:  # pin later loads and the record to the commit just loaded
+        run.req = replace(run.req, revision=target["commit"])
     skip = _reference_skip(run.req, scan)
     if skip:
         novelty = novelty_unavailable(skip, len(scan))
@@ -374,6 +401,7 @@ def _scan_target_step(run: _Run, scan: list[Example]) -> dict:
     with _loaded(run.req.model_id, run.req.revision, run.device) as (model, tok):
         return {
             "n_params": count_params(model),
+            "commit": _loaded_commit(run.req.model_id, run.req.revision),
             "losses": _losses(run, model, tok, scan),
             "scores": _min_k_scores(run, model, tok, texts),
             "calibration": {
@@ -403,6 +431,21 @@ def _finetune_step(run: _Run, examples: list[Example]) -> dict:
     with _loaded(run.req.model_id, run.req.revision, run.device) as (model, tok):
         tuned, stats = finetune_lora(model, tok, examples, run.profile.train, seed=run.seed)
         return {"train": asdict(stats), "correct": _evaluate(run, tuned, tok)}
+
+
+def _loaded_commit(model_id: str, revision: str | None) -> str | None:
+    """The commit a just-loaded Hub model came from: the HF cache snapshot folder of its
+    config.json. None for a local folder or when the cache can't tell.
+
+    (transformers 5 no longer sets `config._commit_hash`; the cache layout is the same
+    across versions.)
+    """
+    try:
+        path = try_to_load_from_cache(model_id, "config.json", revision=revision)
+    except ValueError:  # not a Hub repo id, e.g. a local folder
+        return None
+    match = _SNAPSHOT.search(Path(path).as_posix()) if isinstance(path, str) else None
+    return match.group(1) if match else None
 
 
 def _calibration_texts(run: _Run) -> tuple[list[str], list[str], str | None]:
