@@ -1,0 +1,85 @@
+"""Model registry, loading and memory release."""
+
+import gc
+from dataclasses import dataclass
+from datetime import date
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    model_id: str
+    revision: str | None
+    family: str
+    params_b: float | None
+    reference_id: str | None
+    unseen_after: date | None
+    pretrain_tokens: float | None
+
+
+def _qwen3(size: str, revision: str, params_b: float, reference: str | None) -> ModelInfo:
+    return ModelInfo(
+        model_id=f"Qwen/Qwen3-{size}",
+        revision=revision,
+        family="qwen3",
+        params_b=params_b,
+        reference_id=f"Qwen/Qwen3-{reference}" if reference else None,
+        unseen_after=date(2025, 5, 1),
+        pretrain_tokens=36e12,
+    )
+
+
+REGISTRY: dict[str, ModelInfo] = {
+    info.model_id: info
+    for info in (
+        _qwen3("0.6B", "c1899de289a04d12100db370d81485cdf75e47ca", 0.6, "1.7B"),
+        _qwen3("1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e", 1.7, "4B"),
+        _qwen3("4B", "1cfa9a7208912126459214e8b04321603b3df60c", 4.0, "8B"),
+        _qwen3("8B", "b968826d9c46dd6066d109eabc6255188de91218", 8.0, None),
+    )
+}
+
+
+def model_info(model_id: str) -> ModelInfo:
+    if model_id in REGISTRY:
+        return REGISTRY[model_id]
+    return ModelInfo(model_id, None, "unknown", None, None, None, None)
+
+
+def pick_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def load_model(
+    model_id: str, revision: str | None, device: str, dtype: torch.dtype | None = None
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    if dtype is None:
+        dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, torch_dtype=dtype)
+    model.to(device)
+    model.eval()
+    return model, tokenizer
+
+
+def count_params(model: PreTrainedModel) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def release(model: PreTrainedModel) -> None:
+    device = next(model.parameters()).device.type
+    del model
+    gc.collect()
+    if device == "mps":
+        torch.mps.empty_cache()
+    elif device == "cuda":
+        torch.cuda.empty_cache()
