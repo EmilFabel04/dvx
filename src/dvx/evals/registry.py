@@ -5,6 +5,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
+from dvx.errors import DvxUserError
+
 Group = Literal["target", "adjacent", "side_effect"]
 
 
@@ -50,7 +52,7 @@ class Suite:
 SuiteItems = dict[str, list[MCQItem]]
 
 
-class UnknownDomain(ValueError):
+class UnknownDomain(DvxUserError):
     pass
 
 

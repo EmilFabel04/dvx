@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import dvx
+from dvx.errors import DvxUserError
 
 SCHEMA_VERSION = 1
 
@@ -119,5 +120,5 @@ def read_corpus(corpus_path: Path) -> list[dict]:
         except json.JSONDecodeError as exc:
             if i == len(lines) - 1:
                 break
-            raise ValueError(f"{corpus_path}: line {n} is not valid JSON ({exc.msg})") from exc
+            raise DvxUserError(f"{corpus_path}: line {n} is not valid JSON ({exc.msg})") from exc
     return rows

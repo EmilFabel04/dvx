@@ -9,6 +9,7 @@ from conftest import TINY, TINY_REV
 
 from dvx.config import PROFILES
 from dvx.data import DatasetFormatError, Example
+from dvx.errors import DvxUserError
 from dvx.evals.registry import MCQItem, get_suite
 from dvx.record import read_corpus
 from dvx.run import pipeline
@@ -248,7 +249,7 @@ def test_resume_uses_stored_profile(tmp_path):
     rec = run_scan(req, **overrides())
     (run_dir(req, rec) / "record.json").unlink()
     other = dataclasses.replace(PROFILE, train_cap=4)
-    with pytest.raises(ValueError, match="profile"):
+    with pytest.raises(DvxUserError, match="profile"):
         resume_run(rec.run_id, req.home, **overrides(profile_obj=other))
 
     resumed = resume_run(rec.run_id, req.home, **overrides(profile_obj=None))
