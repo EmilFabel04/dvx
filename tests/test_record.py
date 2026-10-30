@@ -60,6 +60,39 @@ def test_nan_rejected(tmp_path):
     assert read_corpus(tmp_path / "c.jsonl") == []
 
 
+def _line(run_id):
+    return json.dumps(asdict(make_record(run_id)), sort_keys=True)
+
+
+def test_read_corpus_skips_torn_final_line(tmp_path):
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(_line("a") + "\n" + _line("b")[:40])
+    assert [row["run_id"] for row in read_corpus(corpus)] == ["a"]
+
+
+def test_read_corpus_raises_on_malformed_earlier_line(tmp_path):
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(_line("a") + "\n" + _line("b")[:40] + "\n" + _line("c") + "\n")
+    with pytest.raises(ValueError, match="line 2"):
+        read_corpus(corpus)
+
+
+def test_append_after_torn_line_starts_fresh(tmp_path):
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(_line("a") + "\n" + _line("b")[:40])
+    append_to_corpus(make_record("b"), corpus)
+    append_to_corpus(make_record("c"), corpus)
+    assert [row["run_id"] for row in read_corpus(corpus)] == ["a", "b", "c"]
+    assert corpus.read_text() == "".join(_line(r) + "\n" for r in ("a", "b", "c"))
+
+
+def test_append_after_unterminated_complete_line(tmp_path):
+    corpus = tmp_path / "c.jsonl"
+    corpus.write_text(_line("a"))
+    append_to_corpus(make_record("b"), corpus)
+    assert [row["run_id"] for row in read_corpus(corpus)] == ["a", "b"]
+
+
 def test_env_info():
     assert set(env_info("cpu")) == {"python", "platform", "torch", "transformers", "peft",
                                     "datasets", "device", "dvx"}

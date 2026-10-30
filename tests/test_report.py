@@ -28,6 +28,17 @@ def test_sample_notes():
     assert "Impact measured by training on" not in render_report(sample_record())
 
 
+def test_no_training_note_without_impact():
+    for status in ("scan_only", "stopped_baseline"):
+        rec = sample_record(
+            status=status, dataset={"n_total": 30000, "n_scanned": 20000, "n_trained": 5000}
+        )
+        rec["results"].pop("impact")
+        for text in (render_report(rec), render_summary(rec)):
+            assert "Measured on a sample of 20,000 of 30,000 examples." in text
+            assert "Impact measured by training on" not in text
+
+
 def test_headline_then_side_effects_table():
     r = render_report(sample_record())
     headline = "Data-specific gain on target benchmarks: +3.2 pp (95% CI +1.0 to +5.4)"
@@ -116,7 +127,7 @@ def test_baseline_stop():
         "(margin 1.0 pp, need 5.0 pp). Try a larger model."
     ) in r
     assert "Side effects" not in r and "Data-specific gain" not in r
-    assert "Caveats" in r
+    assert "Caveats" not in r
 
 
 def test_baseline_at_or_below_chance_note():
@@ -140,18 +151,23 @@ def test_baseline_note_ignores_non_target_benchmarks():
     assert "Note: arc_challenge" not in render_report(rec)
 
 
-def test_caveats_always_present():
-    for rec in (sample_record(), sample_record(status="stopped_baseline")):
+def test_caveats_only_with_impact():
+    r = render_report(sample_record())
+    assert "## Caveats" in r
+    assert (
+        "Quick profile: one training seed; confidence intervals cover question sampling "
+        "only, not training randomness."
+    ) in r
+    assert (
+        "The control is generic instruction data; part of the raw gain can come from "
+        "learning the answer format."
+    ) in r
+    for status in ("scan_only", "stopped_baseline"):
+        rec = sample_record(status=status)
+        rec["results"].pop("impact")
         r = render_report(rec)
-        assert "## Caveats" in r
-        assert (
-            "Quick profile: one training seed; confidence intervals cover question sampling "
-            "only, not training randomness."
-        ) in r
-        assert (
-            "The control is generic instruction data; part of the raw gain can come from "
-            "learning the answer format."
-        ) in r
+        assert "Caveats" not in r
+        assert "Quick profile:" not in r and "generic instruction data" not in r
 
 
 def test_summary_has_headline_and_warnings():

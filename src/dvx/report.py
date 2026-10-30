@@ -76,7 +76,7 @@ def _sample_notes(record: dict) -> list[str]:
     notes = []
     if d["n_scanned"] < d["n_total"]:
         notes.append(f"Measured on a sample of {d['n_scanned']:,} of {d['n_total']:,} examples.")
-    if d["n_trained"] < d["n_total"]:
+    if "impact" in record["results"] and d["n_trained"] < d["n_total"]:
         notes.append(
             f"Impact measured by training on {d['n_trained']:,} of {d['n_total']:,} examples."
         )
@@ -210,7 +210,8 @@ def render_report(record: dict) -> str:
     if "baseline" in results:
         out += ["## Baseline", ""] + _baseline_lines(record) + [""]
 
-    out += ["## Caveats", ""] + [f"- {c}" for c in CAVEATS] + [""]
+    if "impact" in results:  # the caveats are about the training runs
+        out += ["## Caveats", ""] + [f"- {c}" for c in CAVEATS] + [""]
     return "\n".join(out)
 
 
