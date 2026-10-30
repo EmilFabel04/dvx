@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Secrets and local config
+.env
+.env.*
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Model weights, checkpoints, and caches (never commit these)
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.ckpt
+checkpoints/
+hf_cache/
+
+# dvx local outputs: run artifacts, reports, and the local corpus store
+.dvx/
+runs/
