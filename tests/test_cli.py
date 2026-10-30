@@ -7,6 +7,7 @@ from fixtures import sample_record
 
 from dvx import cli
 from dvx.cli import main
+from dvx.errors import DvxUserError
 from dvx.record import RunRecord, append_to_corpus, save_record
 
 GOOD_LINE = json.dumps(
@@ -38,14 +39,49 @@ def test_bad_dataset_exits_2(tmp_path, capsys):
     assert "Traceback" not in err
 
 
-def test_unknown_domain_exits_2(tmp_path, capsys):
-    data = write_data(tmp_path, GOOD_LINE + "\n")
-    code = main(
-        ["run", str(data), "--model", TINY, "--domain", "law", "--home", str(tmp_path / "h")]
-    )
+def test_unknown_domain_exits_2_before_dataset(tmp_path, capsys):
+    data = write_data(tmp_path, "not json\n")  # invalid too; the domain error must win
+    with pytest.raises(SystemExit) as exc:
+        main(["run", str(data), "--model", TINY, "--domain", "law", "--home", str(tmp_path / "h")])
     err = capsys.readouterr().err
-    assert code == 2
-    assert "medical-qa" in err
+    assert exc.value.code == 2
+    assert "domain" in err and "medical-qa" in err and "line 1" not in err
+
+
+def test_unrelated_value_error_propagates(tmp_path, monkeypatch):
+    def boom(req, **kw):
+        raise ValueError("a bug")
+
+    monkeypatch.setattr(cli, "start_run", boom)
+    data = write_data(tmp_path, GOOD_LINE + "\n")
+    with pytest.raises(ValueError, match="a bug"):
+        main(["run", str(data), "--model", TINY, "--domain", "medical-qa", "--home", str(tmp_path)])
+
+
+def test_debug_env_reraises_user_error(tmp_path, monkeypatch):
+    def boom(run_id, home, **kw):
+        raise DvxUserError("dataset changed")
+
+    monkeypatch.setattr(cli, "resume_run", boom)
+    monkeypatch.setenv("DVX_DEBUG", "1")
+    with pytest.raises(DvxUserError):
+        main(["resume", "x", "--home", str(tmp_path)])
+
+
+@pytest.mark.parametrize("flag", [["--date-range", "2020-01-01", "soon"], ["--unseen-after", "x"]])
+def test_bad_dates_rejected(tmp_path, capsys, flag):
+    data = write_data(tmp_path, GOOD_LINE + "\n")
+    with pytest.raises(SystemExit) as exc:
+        main(["run", str(data), "--model", TINY, "--domain", "medical-qa", *flag])
+    assert exc.value.code == 2
+    assert "expected YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_corpus_list_empty(tmp_path, capsys):
+    assert main(["corpus", "list", "--home", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"no runs in {tmp_path / 'corpus.jsonl'}" in captured.err
 
 
 def test_run_builds_request(tmp_path, monkeypatch, capsys):
@@ -94,7 +130,7 @@ def test_scan_and_resume_dispatch(tmp_path, monkeypatch):
 
 def test_resume_value_error_exits_2(tmp_path, monkeypatch, capsys):
     def boom(run_id, home, **kw):
-        raise ValueError("dataset changed")
+        raise DvxUserError("dataset changed")
 
     monkeypatch.setattr(cli, "resume_run", boom)
     assert main(["resume", "x", "--home", str(tmp_path)]) == 2

@@ -27,6 +27,7 @@ import dvx
 from dvx.config import PROFILES, Profile, ScanConfig, TrainConfig
 from dvx.contamination import find_contamination
 from dvx.data import Example, fingerprint, load_control_examples, load_examples, sample_examples
+from dvx.errors import DvxUserError
 from dvx.evals.registry import Group, Suite, SuiteItems, get_suite, load_suite_items
 from dvx.evals.scorer import score_mcq
 from dvx.evals.stats import BaselineCheck, baseline_check, group_accuracy, paired_delta
@@ -225,7 +226,7 @@ def _prepare(
 ) -> _Run:
     profile = profile_obj or PROFILES[req.profile]
     if len(profile.seeds) != 1:
-        raise ValueError(
+        raise DvxUserError(
             f"the pipeline trains exactly one seed; profile {profile.name!r} has {profile.seeds}"
         )
     suite = get_suite(req.domain)
@@ -309,7 +310,7 @@ def _date_range(req: RunRequest) -> list[str] | None:
 def _execute(run: _Run) -> RunRecord:
     ds = run.step("dataset", lambda: _dataset_step(run))
     if ds["fingerprint"] != run.fingerprint:
-        raise ValueError(
+        raise DvxUserError(
             f"dataset {run.req.data_path} changed since run {run.run_id} started "
             f"(fingerprint was {ds['fingerprint'][:12]}, now {run.fingerprint[:12]})"
         )

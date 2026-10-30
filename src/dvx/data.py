@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from dvx.errors import DvxUserError
+
 DOLLY_ID = "databricks/databricks-dolly-15k"
 DOLLY_REVISION = "bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a"
 
@@ -22,7 +24,7 @@ class Example:
     line: int
 
 
-class DatasetFormatError(ValueError):
+class DatasetFormatError(DvxUserError):
     pass
 
 

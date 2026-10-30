@@ -11,14 +11,24 @@ from datetime import date
 from pathlib import Path
 
 from dvx.config import PROFILES
-from dvx.data import DatasetFormatError
-from dvx.evals.registry import UnknownDomain, get_suite
+from dvx.errors import DvxUserError
+from dvx.evals.registry import SUITES, get_suite
 from dvx.record import RunRecord, read_corpus
 from dvx.report import fmt_delta, render_report, render_summary
 from dvx.run.pipeline import RunRequest, resume_run, run_scan, start_run
 
-# ValueError covers a changed dataset on resume, a profile mismatch and a corrupt corpus.
-USER_ERRORS = (DatasetFormatError, UnknownDomain, FileNotFoundError, ValueError, FileExistsError)
+USER_ERRORS = (DvxUserError, FileNotFoundError, FileExistsError)
+
+
+def _iso_date(text: str) -> str:
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {text!r}") from None
+
+
+def _date(text: str) -> date:
+    return date.fromisoformat(_iso_date(text))
 
 
 def _home_arg(p: argparse.ArgumentParser) -> None:
@@ -31,15 +41,22 @@ def _home_arg(p: argparse.ArgumentParser) -> None:
 
 
 def _request_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("data", type=Path, help="dataset: a JSONL file of chat examples")
+    p.add_argument(
+        "data",
+        type=Path,
+        help='JSONL dataset: {"prompt", "response"} or single-turn {"messages": [...]} per line',
+    )
     p.add_argument("--model", required=True, help="model to measure (Hub id or local folder)")
     p.add_argument("--revision", help="model revision (default: the registry's pinned one)")
     p.add_argument("--reference", help="reference model for the novelty check")
     p.add_argument(
         "--unseen-after",
-        type=date.fromisoformat,
+        type=_date,
         metavar="YYYY-MM-DD",
-        help="the model's release date, for the exposure check",
+        help=(
+            "date after which text is guaranteed unseen by the model (its release date); "
+            "defaults to the registry value"
+        ),
     )
     _home_arg(p)
 
@@ -52,15 +69,25 @@ def _parser() -> argparse.ArgumentParser:
 
     scan = sub.add_parser("scan", help="check a dataset against a model, without training")
     _request_args(scan)
-    scan.add_argument("--domain", default="medical-qa", help="evaluation domain")
+    scan.add_argument(
+        "--domain", default="medical-qa", choices=sorted(SUITES), help="evaluation domain"
+    )
 
     run = sub.add_parser("run", help="scan a dataset and measure its impact by fine-tuning")
     _request_args(run)
-    run.add_argument("--domain", required=True, help="evaluation domain")
+    run.add_argument("--domain", required=True, choices=sorted(SUITES), help="evaluation domain")
     run.add_argument("--profile", choices=sorted(PROFILES), default="quick")
-    run.add_argument("--type", dest="declared_type", help="declared dataset type")
     run.add_argument(
-        "--date-range", nargs=2, metavar=("START", "END"), help="declared dataset date range"
+        "--type",
+        dest="declared_type",
+        help="declared dataset type, recorded in the run record (free text, e.g. medical-qa)",
+    )
+    run.add_argument(
+        "--date-range",
+        nargs=2,
+        type=_iso_date,
+        metavar=("START", "END"),
+        help="declared dataset date range, as YYYY-MM-DD YYYY-MM-DD",
     )
     run.add_argument("--device", choices=["cuda", "mps", "cpu"], help="default: best available")
 
@@ -101,7 +128,7 @@ def _request(args: argparse.Namespace, profile: str) -> RunRequest:
 
 def _print_run(record: RunRecord, home: Path) -> None:
     print(render_summary(asdict(record)))
-    print(f"Report: {home / 'runs' / record.run_id / 'report.md'}")
+    print(f"Report: {(home / 'runs' / record.run_id / 'report.md').resolve()}")
 
 
 def _report(args: argparse.Namespace) -> None:
@@ -112,7 +139,7 @@ def _report(args: argparse.Namespace) -> None:
     record = json.loads(path.read_text(encoding="utf-8"))
     (run_dir / "report.md").write_text(render_report(record), encoding="utf-8")
     print(render_summary(record))
-    print(f"Report: {run_dir / 'report.md'}")
+    print(f"Report: {(run_dir / 'report.md').resolve()}")
 
 
 def _headline(row: dict) -> str:
@@ -121,8 +148,11 @@ def _headline(row: dict) -> str:
 
 
 def _corpus(args: argparse.Namespace) -> None:
-    rows = read_corpus(args.home / "corpus.jsonl")
+    corpus_path = args.home / "corpus.jsonl"
+    rows = read_corpus(corpus_path)
     if args.corpus_command == "list":
+        if not rows:
+            print(f"no runs in {corpus_path}", file=sys.stderr)
         for row in rows:
             fp = row["dataset"]["fingerprint"][:12]
             print(f"{row['run_id']}  {row['status']}  {row['model']['id']}  {fp}  {_headline(row)}")
@@ -151,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _dispatch(args)
     except USER_ERRORS as err:
+        if os.environ.get("DVX_DEBUG"):
+            raise
         print(f"dvx: error: {err}", file=sys.stderr)
         return 2
     return 0
