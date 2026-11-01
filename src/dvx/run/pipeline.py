@@ -208,6 +208,13 @@ def resume_run(
     if record_path.exists():
         return RunRecord(**json.loads(record_path.read_text(encoding="utf-8")))
     saved = json.loads(request_path.read_text(encoding="utf-8"))
+    domain = saved["request"]["domain"]
+    started_with, current = saved.get("suite_version", "1"), get_suite(domain).version
+    if started_with != current:
+        raise DvxUserError(
+            f"run {run_id} was started with suite v{started_with}; this dvx scores {domain} "
+            f"with v{current}, so its cached eval steps are not comparable. Start a new run."
+        )
     _warn_if_engine_changed(run_id, saved.get("engine", {"commit": None, "dirty": None}))
     profile = _profile_from_json(saved["profile"])
     if profile_obj is not None and profile_obj != profile:
@@ -244,6 +251,7 @@ def _new_run(req: RunRequest, *, scan_only: bool, now: datetime | None, **resolv
         "scan_only": scan_only,
         "profile": asdict(run.profile),
         "request": _request_to_json(run.req),
+        "suite_version": run.suite.version,  # resume refuses another version's cached evals
         "engine": engine_source(),
     }
     write_json_atomic(run.dir / "request.json", request, indent=2)

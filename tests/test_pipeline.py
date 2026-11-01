@@ -408,6 +408,23 @@ def test_resume_rejects_changed_dataset(tmp_path):
         resume_run(rec.run_id, req.home, **overrides())
 
 
+@pytest.mark.parametrize("saved_version", ["1", None])
+def test_resume_refuses_a_run_started_under_another_suite_version(tmp_path, saved_version):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    out = run_dir(req, rec)
+    (out / "record.json").unlink()
+    request = json.loads((out / "request.json").read_text())
+    assert request["suite_version"] == "2"
+    if saved_version is None:
+        del request["suite_version"]  # written before the field: suite v1
+    else:
+        request["suite_version"] = saved_version
+    (out / "request.json").write_text(json.dumps(request))
+    with pytest.raises(DvxUserError, match="suite v1; this dvx scores medical-qa with v2"):
+        resume_run(rec.run_id, req.home, **overrides())
+
+
 def test_resume_unknown_run(tmp_path):
     with pytest.raises(FileNotFoundError, match="nope"):
         resume_run("nope", tmp_path / "home")
