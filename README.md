@@ -70,11 +70,11 @@ One JSON object per line, either `{"prompt": ..., "response": ...}` (optionally 
 
 ### Models
 
-The registry pins the pretrained (Base) Qwen3 checkpoints, Apache-2.0: `Qwen/Qwen3-0.6B-Base`, `Qwen/Qwen3-1.7B-Base`, `Qwen/Qwen3-4B-Base` and `Qwen/Qwen3-8B-Base`. Each one's novelty reference is the next size up. Other Hub models work too: pass `--unseen-after` and `--reference`, and dvx records the commits it loaded. Post-trained (chat) checkpoints are not registered, because their losses reflect answer style rather than content.
+The registry pins the pretrained (Base) Qwen3 checkpoints, Apache-2.0: `Qwen/Qwen3-0.6B-Base`, `Qwen/Qwen3-1.7B-Base`, `Qwen/Qwen3-4B-Base` and `Qwen/Qwen3-8B-Base`. The novelty reference for 0.6B, 1.7B and 4B is the next size up; 8B has none, so its novelty is reported as unavailable unless you pass `--reference`. Other Hub models work too: pass `--unseen-after` and `--reference`, and dvx records the commits it loaded. Post-trained (chat) checkpoints are not registered, because their losses reflect answer style rather than content.
 
 ## What the quick report contains
 
-**Part 1: data checks (no training).** These run on up to 20,000 examples; above that, a fixed random sample is used and the report says so.
+**Part 1: data checks (no training).** Novelty, prior exposure and contamination run on up to 20,000 examples; above that, a fixed random sample is used and the report says so. Duplicates are checked over the whole dataset.
 
 - **Novelty.** Each example's response loss under the target model and under a larger reference model splits the data into *known*, *learnable* and *noise*. A reliability gate marks the split **inconclusive** when the reference's loss is below the target's on fewer than half the examples, or when the reference cannot tell true prompt/response pairs from mismatched ones (paired discrimination below 0.6). The report always shows both reliability numbers, the thresholds, loss quartiles and example items.
 - **Prior exposure.** A Min-K% Prob membership score is calibrated on Wikipedia articles from before and after the model's cutoff. The estimate comes with its calibration AUC and is **inconclusive** below 0.6.
