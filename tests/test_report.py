@@ -20,7 +20,9 @@ def test_fmt_delta_marks_a_regression():
 
 def test_header_and_context():
     report = render_report(sample_record())
-    assert report.startswith("# Data Impact Report: Qwen/Qwen3-0.6B-Base on data/med.jsonl")
+    assert report.startswith(
+        "# Data Impact Report: Qwen/Qwen3-0.6B-Base on med.jsonl (fingerprint abcdef012345)"
+    )
     assert "medical-qa" in report and "abcdef012345" in report and "rev123" in report
     assert "abcdef0123456" not in report
 
@@ -205,12 +207,52 @@ def test_exposure_ok_and_inconclusive():
     assert (
         "Calibration compares old vs. new Wikipedia articles; topic drift can inflate the AUC."
     ) in r
+    assert (
+        "The seen/unseen threshold is calibrated on Wikipedia text and applied here to "
+        "another domain; treat the fraction as indicative."
+    ) in r
     rec = sample_record(
         results={"exposure": {"status": "inconclusive", "reason": "AUC below threshold"}}
     )
     r = render_report(rec)
     assert "Prior exposure: inconclusive (AUC below threshold)." in r
     assert "look previously seen" not in r
+
+
+def test_schema_1_header_shows_only_the_file_name():
+    rec = sample_record()
+    del rec["dataset"]["name"]
+    rec["dataset"]["path"] = "/Users/someone/private/med.jsonl"
+    assert render_report(rec).startswith("# Data Impact Report: Qwen/Qwen3-0.6B-Base on med.jsonl")
+
+
+def test_summary_has_the_data_checks():
+    for status in ("complete", "scan_only"):
+        rec = sample_record(status=status)
+        if status == "scan_only":
+            rec["results"].pop("impact")
+            rec["results"].pop("baseline")
+        s = render_summary(rec).splitlines()
+        assert (
+            "Novelty: known 50.0% · learnable 40.0% · noise 10.0% (reference below target on "
+            "72.0% of examples; paired discrimination 0.81)"
+        ) in s
+        exposure = "Prior exposure: about 30% of examples look previously seen"
+        assert f"{exposure} (calibration AUC 0.80)" in s
+        assert "Exact duplicates: 2.0% · near duplicates: 5.0%" in s
+
+
+def test_summary_gives_the_inconclusive_reasons():
+    rec = sample_record(
+        status="scan_only",
+        results={
+            "novelty": {"status": "inconclusive", "reason": "paired discrimination 0.50"},
+            "exposure": {"status": "inconclusive", "reason": "calibration AUC 0.50 below 0.6"},
+        },
+    )
+    s = render_summary(rec).splitlines()
+    assert "Novelty: inconclusive (paired discrimination 0.50)" in s
+    assert "Prior exposure: inconclusive (calibration AUC 0.50 below 0.6)" in s
 
 
 def test_duplicates():
@@ -331,7 +373,7 @@ def test_caveats_only_with_impact():
 def test_summary_has_headline_and_warnings():
     rec = sample_record(results={"contamination": {"n_flagged": 3, "by_benchmark": {"medqa": 3}}})
     s = render_summary(rec)
-    assert s.startswith("Data Impact Report: Qwen/Qwen3-0.6B-Base on data/med.jsonl")
+    assert s.startswith("Data Impact Report: Qwen/Qwen3-0.6B-Base on med.jsonl (fingerprint")
     assert "Data-specific gain on target benchmarks: +3.2 pp" in s
     assert "Side effects (data-specific, tuned − control):" in s
     assert "WARNING: 3 examples overlap" in s

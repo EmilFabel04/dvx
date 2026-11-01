@@ -722,7 +722,7 @@ def _finish(run: _Run, status: str, results: dict, ds: dict, target: dict) -> Ru
         suite_version=run.suite.version,
         env=env_info(run.device),
         dataset={
-            "path": str(req.data_path),
+            "name": req.data_path.name,  # no absolute path: request.json keeps that
             "fingerprint": ds["fingerprint"],
             "n_total": ds["n_total"],
             "n_scanned": len(ds["scan_lines"]),

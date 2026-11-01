@@ -3,6 +3,8 @@
 Pure functions: dict in, str out. The pipeline and CLI write the files.
 """
 
+from pathlib import PurePath
+
 from dvx.evals.registry import get_suite
 
 GROUPS = ("target", "adjacent", "side_effect")
@@ -46,7 +48,10 @@ def fmt_delta(e: dict) -> str:
 
 
 def _header(record: dict) -> str:
-    return f"Data Impact Report: {record['model']['id']} on {record['dataset']['path']}"
+    d = record["dataset"]
+    name = d.get("name") or PurePath(d["path"]).name  # schema 1 recorded the full path
+    model = record["model"]["id"]
+    return f"Data Impact Report: {model} on {name} (fingerprint {d['fingerprint'][:12]})"
 
 
 def _headline(record: dict) -> str | None:
@@ -237,7 +242,16 @@ def _exposure_lines(exposure: dict) -> list[str]:
             f"(calibration AUC {exposure['auc']:.2f})."
         ),
         "Calibration compares old vs. new Wikipedia articles; topic drift can inflate the AUC.",
+        (
+            "The seen/unseen threshold is calibrated on Wikipedia text and applied here to "
+            "another domain; treat the fraction as indicative."
+        ),
     ]
+
+
+def _duplicates_line(d: dict) -> str:
+    exact, near = d["exact_fraction"], d["near_fraction"]
+    return f"Exact duplicates: {exact:.1%} · near duplicates: {near:.1%}"
 
 
 def _baseline_lines(record: dict) -> list[str]:
@@ -323,14 +337,7 @@ def render_report(record: dict) -> str:
     if "exposure" in results:
         out += _exposure_lines(results["exposure"]) + [""]
     if "duplicates" in results:
-        d = results["duplicates"]
-        out += [
-            (
-                f"Exact duplicates: {d['exact_fraction']:.1%} · "
-                f"near duplicates: {d['near_fraction']:.1%}"
-            ),
-            "",
-        ]
+        out += [_duplicates_line(results["duplicates"]), ""]
     if "baseline" in results:
         out += ["## Baseline", ""]
         for paragraph in _baseline_lines(record):
@@ -341,8 +348,40 @@ def render_report(record: dict) -> str:
     return "\n".join(out)
 
 
+def _summary_checks(results: dict) -> list[str]:
+    """One line each for novelty, exposure and duplicates (or why they are inconclusive)."""
+    out = []
+    novelty = results.get("novelty")
+    if novelty and novelty["status"] == "ok":
+        f, rel = novelty["fractions"], novelty.get("reliability")
+        line = (
+            f"Novelty: known {f['known']:.1%} · learnable {f['learnable']:.1%} "
+            f"· noise {f['noise']:.1%}"
+        )
+        if rel:
+            line += (
+                f" (reference below target on {rel['reference_below_target']:.1%} of examples; "
+                f"paired discrimination {rel['paired_discrimination']:.2f})"
+            )
+        out.append(line)
+    elif novelty:
+        out.append(f"Novelty: {novelty['status']} ({novelty['reason']})")
+    exposure = results.get("exposure")
+    if exposure and exposure["status"] == "ok":
+        out.append(
+            f"Prior exposure: about {exposure['seen_fraction']:.0%} of examples look previously "
+            f"seen (calibration AUC {exposure['auc']:.2f})"
+        )
+    elif exposure:
+        out.append(f"Prior exposure: inconclusive ({exposure['reason']})")
+    if "duplicates" in results:
+        out.append(_duplicates_line(results["duplicates"]))
+    return out
+
+
 def render_summary(record: dict) -> str:
-    """Render the short terminal summary: header, headline, side effects, warnings."""
+    """Render the short terminal summary: header, headline, side effects, warnings, and
+    one line per data check."""
     out = [_header(record), *_sample_notes(record)]
     headline = _headline(record)
     if headline:
@@ -358,4 +397,5 @@ def render_summary(record: dict) -> str:
         out.append(stop)
     out.extend(_warnings(record))
     out.extend(_chance_notes(record))
+    out.extend(_summary_checks(record["results"]))
     return "\n".join(out)

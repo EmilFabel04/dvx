@@ -57,7 +57,7 @@ def sample_record(**overrides) -> dict:
         "suite_version": "2",
         "env": {"device": "cpu"},
         "dataset": {
-            "path": "data/med.jsonl",
+            "name": "med.jsonl",
             "fingerprint": "abcdef0123456789" * 4,
             "n_total": 1000,
             "n_scanned": 1000,

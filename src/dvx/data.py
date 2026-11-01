@@ -47,6 +47,15 @@ def _parse_messages(messages: object, n: int) -> tuple[str | None, object, objec
     raise DatasetFormatError(f"line {n}: {_MISSING}")
 
 
+def _is_valid_unicode(text: str) -> bool:
+    """False if json.loads left a lone surrogate (an unpaired \\ud800-\\udfff escape)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _parse_line(text: str, n: int) -> Example:
     try:
         obj = json.loads(text)
@@ -63,7 +72,13 @@ def _parse_line(text: str, n: int) -> Example:
     if not isinstance(prompt, str) or not isinstance(response, str):
         raise DatasetFormatError(f"line {n}: prompt and response must be strings")
     if system is not None and not isinstance(system, str):
-        raise DatasetFormatError(f"line {n}: system must be strings")
+        raise DatasetFormatError(f"line {n}: system must be a string")
+    for field_text in (system, prompt, response):
+        if field_text is not None and not _is_valid_unicode(field_text):
+            raise DatasetFormatError(
+                f"line {n}: text contains a lone surrogate escape (such as \\ud800), "
+                "which is not valid Unicode"
+            )
     if not response.strip():
         raise DatasetFormatError(f"line {n}: empty response")
     return Example(prompt=prompt, response=response, system=system, line=n)

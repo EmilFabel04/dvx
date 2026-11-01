@@ -64,7 +64,18 @@ def test_blank_lines_skipped(tmp_path):
         ('{"prompt": "p"}', "missing"),
         (MULTI_TURN_LINE, "multi-turn"),
         ('{"prompt": 1, "response": "r"}', "must be strings"),
+        ('{"prompt": "p", "response": "r", "system": 1}', "system must be a string"),
         ('{"prompt": "p", "response": "  "}', "empty response"),
+        ('{"prompt": "p", "response": "bad \\ud800 surrogate"}', "lone surrogate"),
+        ('{"prompt": "\\udc00", "response": "r"}', "lone surrogate"),
+        ('{"prompt": "p", "response": "r", "system": "\\ud83d"}', "lone surrogate"),
+        (
+            (
+                '{"messages": [{"role": "user", "content": "\\ud800"}, '
+                '{"role": "assistant", "content": "a"}]}'
+            ),
+            "lone surrogate",
+        ),
     ],
 )
 def test_errors_name_line(tmp_path, bad, msg):
@@ -95,6 +106,13 @@ def test_bom_tolerated(tmp_path):
 
 def _exs(n):
     return [Example(prompt=f"p{i}", response=f"r{i}", system=None, line=i + 1) for i in range(n)]
+
+
+def test_surrogate_pairs_are_fine_and_keep_their_fingerprint(tmp_path):
+    p = _write(tmp_path, '{"prompt": "smile \\ud83d\\ude00", "response": "r"}\n')
+    (ex,) = load_examples(p)
+    assert ex.prompt == "smile \U0001f600"
+    assert fingerprint([ex]) == fingerprint([Example("smile \U0001f600", "r", None, 1)])
 
 
 def test_fingerprint():

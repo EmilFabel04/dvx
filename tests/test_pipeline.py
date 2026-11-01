@@ -309,6 +309,30 @@ def test_resume_is_quiet_when_the_engine_source_matches(tmp_path, capsys):
     assert "warning" not in capsys.readouterr().err
 
 
+def test_no_absolute_paths_in_record_corpus_or_report(tmp_path):
+    req = make_request(tmp_path)
+    rec = start_run(req, **overrides())
+    out = run_dir(req, rec)
+    home = str(tmp_path)
+    assert home not in json.dumps(dataclasses.asdict(rec))
+    assert home not in (req.home / "corpus.jsonl").read_text()
+    assert home not in (out / "report.md").read_text()
+    assert rec.dataset["name"] == "data.jsonl"
+    assert json.loads((out / "request.json").read_text())["request"]["data_path"].startswith(home)
+
+
+def test_steps_report_progress_on_stderr(tmp_path, capsys):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    err = capsys.readouterr().err.splitlines()
+    for step in ("dataset", "duplicates", "contamination", "scan_target", "scan_reference"):
+        assert f"dvx: step {step} started" in err
+        assert any(re.fullmatch(rf"dvx: step {step} finished in \d+\.\d s", line) for line in err)
+    (run_dir(req, rec) / "record.json").unlink()
+    resume_run(rec.run_id, req.home, **overrides())
+    assert "dvx: step scan_target cached" in capsys.readouterr().err.splitlines()
+
+
 def test_baseline_stop(tmp_path):
     req = make_request(tmp_path)
     rec = start_run(
@@ -410,7 +434,7 @@ def test_relative_data_path_resumes_from_elsewhere(tmp_path, monkeypatch):
     absolute = str((tmp_path / "data.jsonl").resolve())
     out = run_dir(req, rec)
     assert json.loads((out / "request.json").read_text())["request"]["data_path"] == absolute
-    assert rec.dataset["path"] == absolute
+    assert rec.dataset["name"] == "data.jsonl" and "path" not in rec.dataset
 
     (out / "record.json").unlink()
     elsewhere = tmp_path / "elsewhere"

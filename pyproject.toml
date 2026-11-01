@@ -14,6 +14,7 @@ dependencies = [
     "transformers>=4.56",
     "peft>=0.15",
     "datasets>=3.0",
+    "huggingface_hub>=0.34",
     "numpy>=1.26",
     "datasketch>=1.6",
 ]
