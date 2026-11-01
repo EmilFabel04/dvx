@@ -40,6 +40,9 @@ class ScanConfig:
     calibration_per_side: int = 200
     score_max_len: int = 1024
     batch_size: int = 8
+    # Few-shot eval prompts: the longest in medical-qa v2 is 2,658 tokens (PubMedQA;
+    # MedQA 1,979). Longer prompts are left-truncated and counted.
+    eval_max_len: int = 3072
 
 
 @dataclass(frozen=True)

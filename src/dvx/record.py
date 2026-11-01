@@ -14,7 +14,7 @@ from typing import Literal
 import dvx
 from dvx.errors import DvxUserError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -34,6 +34,7 @@ class RunRecord:
     config: dict
     results: dict
     compute: dict
+    evaluation: dict | None = None  # added in schema 2; None for a scan
 
 
 def new_run_id(now: datetime, fingerprint: str) -> str:

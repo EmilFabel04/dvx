@@ -71,6 +71,18 @@ def _truncation_line(record: dict) -> str | None:
     return f"{n:,} training examples were truncated to {record['config']['train']['max_seq_len']} tokens."
 
 
+def _eval_truncation_line(record: dict) -> str | None:
+    ev = record.get("evaluation")
+    cut = {b: n for b, n in (ev or {}).get("n_truncated", {}).items() if n > 0}
+    if not cut:
+        return None
+    by = ", ".join(f"{b} {n:,}" for b, n in cut.items())
+    return (
+        f"Evaluation prompts left-truncated to {ev['max_len']} tokens "
+        f"(their earliest shots cut): {by}."
+    )
+
+
 def _sample_notes(record: dict) -> list[str]:
     d = record["dataset"]
     notes = []
@@ -85,8 +97,10 @@ def _sample_notes(record: dict) -> list[str]:
 
 def _context_line(record: dict) -> str:
     m, d = record["model"], record["dataset"]
+    ev = record.get("evaluation")
+    suite = f"suite v{record['suite_version']}" + (f", {ev['protocol']}" if ev else "")
     return (
-        f"Domain: {record['domain']} (suite v{record['suite_version']}) · "
+        f"Domain: {record['domain']} ({suite}) · "
         f"profile: {record['profile']} · dataset fingerprint: {d['fingerprint'][:12]} · "
         f"model revision: {m['revision']} · parameters: {m['params']:,} · "
         f"seeds: {', '.join(str(s) for s in record['seeds'])}"
@@ -168,6 +182,15 @@ def _chance_notes(record: dict) -> list[str]:
     return lines
 
 
+def _warnings(record: dict) -> list[str]:
+    lines = (
+        _contamination_warning(record),
+        _truncation_line(record),
+        _eval_truncation_line(record),
+    )
+    return [line for line in lines if line]
+
+
 def render_report(record: dict) -> str:
     """Render the full Markdown report."""
     results = record["results"]
@@ -183,9 +206,8 @@ def render_report(record: dict) -> str:
     if impact:
         out += [_headline(record), ""]
 
-    for warning in (_contamination_warning(record), _truncation_line(record)):
-        if warning:
-            out += [warning, ""]
+    for warning in _warnings(record):
+        out += [warning, ""]
 
     if impact:
         out += ["## Side effects", ""] + _side_effects_table(impact) + [""]
@@ -229,8 +251,6 @@ def render_summary(record: dict) -> str:
     stop = _stop_line(record)
     if stop:
         out.append(stop)
-    for warning in (_contamination_warning(record), _truncation_line(record)):
-        if warning:
-            out.append(warning)
+    out.extend(_warnings(record))
     out.extend(_chance_notes(record))
     return "\n".join(out)

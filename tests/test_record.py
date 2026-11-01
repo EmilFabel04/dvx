@@ -26,6 +26,14 @@ def make_record(run_id="20261030-210509-abcdef01"):
     )
 
 
+def test_schema_v2_and_v1_records_still_load():
+    assert SCHEMA_VERSION == 2
+    v1 = asdict(make_record())
+    del v1["evaluation"]  # schema 1 records predate the field
+    v1["schema_version"] = 1
+    assert RunRecord(**v1).evaluation is None
+
+
 def test_run_id():
     assert new_run_id(datetime(2026, 10, 30, 21, 5, 9), "abcdef0123" + "0" * 54) \
         == "20261030-210509-abcdef01"

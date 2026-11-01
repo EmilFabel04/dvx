@@ -142,7 +142,7 @@ def test_corpus_list_and_export(tmp_path, capsys):
     append_to_corpus(rec, tmp_path / "corpus.jsonl")
     assert main(["corpus", "list", "--home", str(tmp_path)]) == 0
     line = capsys.readouterr().out.strip()
-    assert line.startswith(f"{rec.run_id}  complete  Qwen/Qwen3-0.6B  abcdef012345  ")
+    assert line.startswith(f"{rec.run_id}  complete  Qwen/Qwen3-0.6B-Base  abcdef012345  ")
     assert "pp" in line
     out = tmp_path / "out.jsonl"
     assert main(["corpus", "export", str(out), "--home", str(tmp_path)]) == 0

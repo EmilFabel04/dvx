@@ -21,13 +21,16 @@ class ModelInfo:
     pretrain_tokens: float | None
 
 
-def _qwen3(size: str, revision: str, params_b: float, reference: str | None) -> ModelInfo:
+def _qwen3_base(size: str, revision: str, params_b: float, reference: str | None) -> ModelInfo:
+    """A Qwen3 pretrained (Base) checkpoint. Post-trained Qwen3 checkpoints are not
+    registered: they score answer style rather than content, which breaks the novelty
+    comparison and letter scoring."""
     return ModelInfo(
-        model_id=f"Qwen/Qwen3-{size}",
+        model_id=f"Qwen/Qwen3-{size}-Base",
         revision=revision,
         family="qwen3",
         params_b=params_b,
-        reference_id=f"Qwen/Qwen3-{reference}" if reference else None,
+        reference_id=f"Qwen/Qwen3-{reference}-Base" if reference else None,
         unseen_after=date(2025, 5, 1),
         pretrain_tokens=36e12,
     )
@@ -36,10 +39,10 @@ def _qwen3(size: str, revision: str, params_b: float, reference: str | None) -> 
 REGISTRY: dict[str, ModelInfo] = {
     info.model_id: info
     for info in (
-        _qwen3("0.6B", "c1899de289a04d12100db370d81485cdf75e47ca", 0.6, "1.7B"),
-        _qwen3("1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e", 1.7, "4B"),
-        _qwen3("4B", "1cfa9a7208912126459214e8b04321603b3df60c", 4.0, "8B"),
-        _qwen3("8B", "b968826d9c46dd6066d109eabc6255188de91218", 8.0, None),
+        _qwen3_base("0.6B", "da87bfb608c14b7cf20ba1ce41287e8de496c0cd", 0.6, "1.7B"),
+        _qwen3_base("1.7B", "ea980cb0a6c2ae4b936e82123acc929f1cec04c1", 1.7, "4B"),
+        _qwen3_base("4B", "906bfd4b4dc7f14ee4320094d8b41684abff8539", 4.0, "8B"),
+        _qwen3_base("8B", "49e3418fbbbca6ecbdf9608b4d22e5a407081db4", 8.0, None),
     )
 }
 

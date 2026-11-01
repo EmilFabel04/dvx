@@ -28,8 +28,16 @@ from dvx.config import PROFILES, Profile, ScanConfig, TrainConfig
 from dvx.contamination import find_contamination
 from dvx.data import Example, fingerprint, load_control_examples, load_examples, sample_examples
 from dvx.errors import DvxUserError
-from dvx.evals.registry import Group, Suite, SuiteItems, get_suite, load_suite_items
-from dvx.evals.scorer import score_mcq
+from dvx.evals.registry import (
+    N_SHOTS,
+    Group,
+    Suite,
+    SuiteItems,
+    get_suite,
+    load_suite_items,
+    load_suite_shots,
+)
+from dvx.evals.scorer import PROTOCOL, score_mcq
 from dvx.evals.stats import BaselineCheck, baseline_check, group_accuracy, paired_delta
 from dvx.models import count_params, load_model, model_info, pick_device, release
 from dvx.record import (
@@ -88,6 +96,7 @@ class _Run:
     profile: Profile
     suite: Suite
     items: SuiteItems
+    shots: SuiteItems  # few-shot examples per benchmark; empty for a scan
     device: str
     calibration_fetcher: CalibrationFetcher
     control_loader: ControlLoader
@@ -111,6 +120,7 @@ def start_run(
     *,
     profile_obj: Profile | None = None,
     items: SuiteItems | None = None,
+    shots: SuiteItems | None = None,
     calibration_fetcher: CalibrationFetcher = fetch_calibration_texts,
     control_loader: ControlLoader = load_control_examples,
     device: str | None = None,
@@ -123,6 +133,7 @@ def start_run(
         now=now,
         profile_obj=profile_obj,
         items=items,
+        shots=shots,
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
         device=device,
@@ -134,6 +145,7 @@ def run_scan(
     *,
     profile_obj: Profile | None = None,
     items: SuiteItems | None = None,
+    shots: SuiteItems | None = None,
     calibration_fetcher: CalibrationFetcher = fetch_calibration_texts,
     control_loader: ControlLoader = load_control_examples,
     device: str | None = None,
@@ -146,6 +158,7 @@ def run_scan(
         now=now,
         profile_obj=profile_obj,
         items=items,
+        shots=shots,
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
         device=device,
@@ -158,6 +171,7 @@ def resume_run(
     *,
     profile_obj: Profile | None = None,
     items: SuiteItems | None = None,
+    shots: SuiteItems | None = None,
     calibration_fetcher: CalibrationFetcher = fetch_calibration_texts,
     control_loader: ControlLoader = load_control_examples,
     device: str | None = None,
@@ -188,6 +202,7 @@ def resume_run(
         examples,
         profile_obj=profile,
         items=items,
+        shots=shots,
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
         device=device,
@@ -220,6 +235,7 @@ def _prepare(
     *,
     profile_obj: Profile | None,
     items: SuiteItems | None,
+    shots: SuiteItems | None,
     calibration_fetcher: CalibrationFetcher,
     control_loader: ControlLoader,
     device: str | None,
@@ -230,6 +246,10 @@ def _prepare(
             f"the pipeline trains exactly one seed; profile {profile.name!r} has {profile.seeds}"
         )
     suite = get_suite(req.domain)
+    if items is None:
+        items = load_suite_items(suite)
+    if shots is None:
+        shots = {} if scan_only else load_suite_shots(suite, items)
     return _Run(
         req=req,
         run_id=run_id,
@@ -239,7 +259,8 @@ def _prepare(
         fingerprint=fingerprint(examples),
         profile=profile,
         suite=suite,
-        items=items if items is not None else load_suite_items(suite),
+        items=items,
+        shots=shots,
         device=device or pick_device(),
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
@@ -424,14 +445,14 @@ def _scan_reference_step(run: _Run, scan: list[Example]) -> dict:
 
 def _eval_base_step(run: _Run) -> dict:
     with _loaded(run.req.model_id, run.req.revision, run.device) as (model, tok):
-        return {"correct": _evaluate(run, model, tok)}
+        return _evaluate(run, model, tok)
 
 
 def _finetune_step(run: _Run, examples: list[Example]) -> dict:
     # A fresh target every time: peft wraps the model in place.
     with _loaded(run.req.model_id, run.req.revision, run.device) as (model, tok):
         tuned, stats = finetune_lora(model, tok, examples, run.profile.train, seed=run.seed)
-        return {"train": asdict(stats), "correct": _evaluate(run, tuned, tok)}
+        return {"train": asdict(stats), **_evaluate(run, tuned, tok)}
 
 
 def _loaded_commit(model_id: str, revision: str | None) -> str | None:
@@ -484,13 +505,23 @@ def _min_k_scores(run: _Run, model, tok, texts: list[str]) -> list[float | None]
     return [None if np.isnan(s) else s for s in scores]
 
 
-def _evaluate(run: _Run, model, tok) -> dict[str, list[bool]]:
+def _evaluate(run: _Run, model, tok) -> dict:
+    """Per benchmark: item correctness and the number of left-truncated prompts."""
     cfg = run.profile.scan
-    return {
+    scores = {
         b.name: score_mcq(
-            model, tok, run.items[b.name], batch_size=cfg.batch_size, max_len=cfg.score_max_len
-        ).tolist()
+            model,
+            tok,
+            run.items[b.name],
+            run.shots[b.name],
+            batch_size=cfg.batch_size,
+            max_len=cfg.eval_max_len,
+        )
         for b in run.suite.benchmarks
+    }
+    return {
+        "correct": {name: s.correct.tolist() for name, s in scores.items()},
+        "n_truncated": {name: s.n_truncated for name, s in scores.items()},
     }
 
 
@@ -559,6 +590,26 @@ def _impact(run: _Run, base: dict, tuned: dict, control: dict) -> dict:
     }
 
 
+def _evaluation(run: _Run) -> dict | None:
+    """How the eval steps scored: protocol, shot item IDs and truncation; None for a scan."""
+    base = run.outputs.get("eval_base")
+    if base is None:
+        return None
+    return {
+        "protocol": PROTOCOL,
+        "n_shots": N_SHOTS,
+        "max_len": run.profile.scan.eval_max_len,
+        "shots": {
+            b.name: {
+                "split": b.shot_split or b.split,
+                "item_ids": [s.item_id for s in run.shots[b.name]],
+            }
+            for b in run.suite.benchmarks
+        },
+        "n_truncated": base["n_truncated"],
+    }
+
+
 def _compute(run: _Run) -> dict:
     trained = [out["train"] for out in run.outputs.values() if "train" in out]
     return {
@@ -603,6 +654,7 @@ def _finish(run: _Run, status: str, results: dict, ds: dict, target: dict) -> Ru
         config=asdict(run.profile),
         results=results,
         compute=_compute(run),
+        evaluation=_evaluation(run),
     )
     (run.dir / "report.md").write_text(render_report(asdict(record)), encoding="utf-8")
     corpus = req.home / "corpus.jsonl"

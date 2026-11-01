@@ -30,6 +30,13 @@ ITEMS = {
     ]
     for b in get_suite("medical-qa").benchmarks
 }
+SHOTS = {
+    name: [
+        MCQItem(name, f"{name}-shot-{i}", f"Solved example {i}?", ("one", "two", "three"), i % 3)
+        for i in range(5)
+    ]
+    for name in ITEMS
+}
 PROFILE = dataclasses.replace(
     PROFILES["quick"], train_cap=8, baseline_margin=-1.0, bootstrap_samples=50
 )
@@ -87,6 +94,7 @@ def overrides(**kw):
     return {
         "profile_obj": PROFILE,
         "items": ITEMS,
+        "shots": SHOTS,
         "calibration_fetcher": fake_fetcher,
         "control_loader": fake_control,
         "device": "cpu",
@@ -165,6 +173,38 @@ def test_quick_end_to_end(tmp_path, monkeypatch):
     assert not (out / "request.json.tmp").exists()
 
 
+def test_evaluation_protocol_and_shots_recorded(tmp_path):
+    req = make_request(tmp_path)
+    rec = start_run(req, **overrides())
+    ev = rec.evaluation
+    assert ev["protocol"] == "plain-text 5-shot log-likelihood letter scoring"
+    assert ev["max_len"] == PROFILE.scan.eval_max_len == 3072
+    for b in get_suite("medical-qa").benchmarks:
+        assert ev["shots"][b.name] == {
+            "split": b.shot_split or b.split,
+            "item_ids": [s.item_id for s in SHOTS[b.name]],
+        }
+    assert ev["n_truncated"] == {name: 0 for name in ITEMS}
+    steps = run_dir(req, rec) / "steps"
+    for step in ("eval_base", "tuned_s0", "control_s0"):
+        saved = json.loads((steps / f"{step}.json").read_text())
+        assert saved["n_truncated"] == ev["n_truncated"]
+
+
+def test_eval_prompts_carry_the_shots(tmp_path, monkeypatch):
+    calls = []
+    real = pipeline.score_mcq
+
+    def spy_score(model, tok, items, shots, **kwargs):
+        calls.append((items[0].benchmark, list(shots), kwargs["max_len"]))
+        return real(model, tok, items, shots, **kwargs)
+
+    monkeypatch.setattr(pipeline, "score_mcq", spy_score)
+    start_run(make_request(tmp_path), **overrides())
+    assert len(calls) == 3 * len(ITEMS)  # base, tuned, control
+    assert all(shots == SHOTS[name] and max_len == 3072 for name, shots, max_len in calls)
+
+
 def test_baseline_stop(tmp_path):
     req = make_request(tmp_path)
     rec = start_run(
@@ -206,7 +246,7 @@ def test_resume_finished_run_returns_record(tmp_path, monkeypatch):
     req = make_request(tmp_path)
     rec = run_scan(req, **overrides())
     saved = json.loads((run_dir(req, rec) / "record.json").read_text())
-    for name in ("load_examples", "load_model", "load_suite_items"):
+    for name in ("load_examples", "load_model", "load_suite_items", "load_suite_shots"):
         monkeypatch.setattr(pipeline, name, fail)
 
     resumed = resume_run(rec.run_id, req.home)
@@ -292,10 +332,12 @@ def test_unknown_model_and_offline(tmp_path, monkeypatch):
     assert [rev for _, rev, _ in loads] == [None, commit, commit, commit]
 
 
-def test_scan_only(tmp_path):
+def test_scan_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "load_suite_shots", fail)  # a scan needs no shots
     req = make_request(tmp_path, unseen_after=None)
-    rec = run_scan(req, **overrides(calibration_fetcher=fail))
+    rec = run_scan(req, **overrides(calibration_fetcher=fail, shots=None))
     assert rec.status == "scan_only"
+    assert rec.evaluation is None
     assert set(rec.results) == {"duplicates", "contamination", "novelty", "exposure"}
     assert rec.results["novelty"]["status"] == "ok"
     exposure = rec.results["exposure"]

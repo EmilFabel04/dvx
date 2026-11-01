@@ -14,7 +14,7 @@ def test_fmt_delta_positive_and_zero():
 
 def test_header_and_context():
     report = render_report(sample_record())
-    assert report.startswith("# Data Impact Report: Qwen/Qwen3-0.6B on data/med.jsonl")
+    assert report.startswith("# Data Impact Report: Qwen/Qwen3-0.6B-Base on data/med.jsonl")
     assert "medical-qa" in report and "abcdef012345" in report and "rev123" in report
     assert "abcdef0123456" not in report
 
@@ -173,11 +173,32 @@ def test_caveats_only_with_impact():
 def test_summary_has_headline_and_warnings():
     rec = sample_record(results={"contamination": {"n_flagged": 3, "by_benchmark": {"medqa": 3}}})
     s = render_summary(rec)
-    assert s.startswith("Data Impact Report: Qwen/Qwen3-0.6B on data/med.jsonl")
+    assert s.startswith("Data Impact Report: Qwen/Qwen3-0.6B-Base on data/med.jsonl")
     assert "Data-specific gain on target benchmarks: +3.2 pp" in s
     assert "Side effects" in s
     assert "WARNING: 3 examples overlap" in s
     assert "| " not in s
+
+
+def test_eval_truncation_reported_before_gains():
+    counts = {"medqa": 0, "medmcqa": 0, "pubmedqa": 12, "arc_challenge": 1}
+    rec = sample_record(evaluation={"n_truncated": counts})
+    line = (
+        "Evaluation prompts left-truncated to 3072 tokens (their earliest shots cut): "
+        "pubmedqa 12, arc_challenge 1."
+    )
+    r = render_report(rec)
+    assert line in r and r.index(line) < r.index("## Side effects")
+    assert line in render_summary(rec)
+    assert "left-truncated" not in render_report(sample_record())
+    rec = sample_record(status="stopped_baseline", evaluation={"n_truncated": counts})
+    rec["results"].pop("impact")
+    assert line in render_report(rec)
+
+
+def test_context_line_names_the_eval_protocol():
+    r = render_report(sample_record())
+    assert "suite v2, plain-text 5-shot log-likelihood letter scoring" in r
 
 
 def test_contamination_warning_precedes_gains():
