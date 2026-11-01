@@ -4,6 +4,7 @@ Machine: Apple M5, 16 GB. Model: Qwen/Qwen3-0.6B (596,049,920 params). Profile: 
 250 optimizer steps per arm). Data: 2,000 MedMCQA train examples. Engine commit: `5ecee1b`.
 Run: `20261101-201145-8c7ff65f`. Total wall time 3,053 s (50 min 53 s, `/usr/bin/time`).
 Hub downloads were already cached for this run.
+Examples truncated to 512 tokens: 79 in the tuned arm, 120 in the control arm.
 
 ## Wall time per step (`record.json`, `compute.steps`)
 
@@ -54,9 +55,9 @@ footprint, not Python's, so it is not usable here. What we have:
 Formula: 19 x mean(tuned_s0, control_s0) + scan_target + scan_reference + eval_base
 
 - mean(1,236.7, 1,270.1) = 1,253.4 s
-- 19 x 1,253.4 = 23,814.6 s
+- 19 x 1,253.397 (unrounded mean) = 23,814.5 s
 - plus 220.0 + 206.4 + 97.8 = 524.2 s
-- Total = 24,338.8 s = **about 6.8 hours**
+- Total = 24,338.7 s = **about 6.8 hours**
 
 Each fine-tune step already includes its own eval. This is an upper bound if M2's
 scaling-curve fine-tunes use fewer examples than the 2,000 used here.
@@ -67,8 +68,9 @@ extrapolation, not a measurement.
 ## What this run says about the tool
 
 - The raw gains are large in both arms: target +6.0, adjacent +18.0, side_effect +16.5 pp.
-  The data-specific deltas are near zero, so most of the raw gain is learning the answer
-  format. The control arm is essential.
+  The target and side_effect data-specific deltas are near zero. The control arm gains
+  almost as much on target (+5.3 vs +6.0 pp), so most of the raw gain likely comes from
+  learning the answer format. The control arm is essential.
 - The data-specific adjacent effect is -3.8 pp (95% CI -7.5 to -0.4), which excludes zero.
   That is a measured harm against generic instruction data.
 - Novelty labelled 80.5% of a clean, real dataset as "noise" and only 0.1% as "learnable".
