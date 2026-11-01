@@ -1,5 +1,8 @@
 import json
+import re
+import shlex
 from datetime import date
+from pathlib import Path
 
 import pytest
 from conftest import TINY, TINY_REV
@@ -176,3 +179,20 @@ def test_home_defaults_to_env(monkeypatch, tmp_path):
     monkeypatch.setenv("DVX_HOME", str(tmp_path / "envhome"))
     args = cli._parser().parse_args(["resume", "x"])
     assert args.home == tmp_path / "envhome"
+
+
+def _readme_commands() -> list[list[str]]:
+    """Every `uv run dvx ...` command in README.md's code blocks, as argv (no `dvx`)."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    blocks = re.findall(r"```(?:bash|sh)?\n(.*?)```", readme, flags=re.DOTALL)
+    joined = [line for b in blocks for line in b.replace("\\\n", " ").splitlines()]
+    return [shlex.split(line)[3:] for line in joined if line.startswith("uv run dvx ")]
+
+
+def test_readme_commands_parse_and_cover_every_subcommand():
+    commands = _readme_commands()
+    assert {argv[0] for argv in commands} == {"scan", "run", "resume", "report", "corpus"}
+    for argv in commands:
+        cli._parser().parse_args(argv)  # exits on a stale flag or subcommand
+    run = next(argv for argv in commands if argv[0] == "run")
+    assert run[run.index("--model") + 1] == "Qwen/Qwen3-1.7B-Base"

@@ -1,43 +1,132 @@
 # dvx
 
-**Measure what a dataset actually does to a model, before you buy it or train on it.**
+**Measure what a text dataset does to a language model.**
 
-Today datasets are sold by describing what they *are*: size, type, license, a sample. Nobody says what they will *do* to a model. dvx is an open, reproducible engine that takes **one dataset and one target model** and produces a **Data Impact Report**: a breakdown of what that data changes in that model, in that context.
+dvx takes **one dataset and one target model** and writes a **Data Impact Report**: what fine-tuning on that data changes in that model, against a generic-data control, with confidence intervals. Every number comes with the model, revision and context it was measured in. Each run also appends a structured record to a local **corpus**, the start of a dataset of "data about data value".
 
-It is a tool you can check, not a score you have to trust. Anyone with the same inputs can rerun it and get the same result.
+> **Status: Milestone 1 (the quick report).** It works end to end on a laptop. The full report (scaling curve, clean-gain rerun, cluster contributions, multiple seeds) is Milestone 2. The design is in [`docs/superpowers/specs/2026-10-30-data-impact-engine-design.md`](docs/superpowers/specs/2026-10-30-data-impact-engine-design.md).
 
-> **Status: pre-alpha, design stage.** Nothing is runnable yet. The v1 design is in [`docs/superpowers/specs/2026-10-30-data-impact-engine-design.md`](docs/superpowers/specs/2026-10-30-data-impact-engine-design.md).
+## Install
 
-## What the report answers
+You need Python 3.12 or newer and [uv](https://docs.astral.sh/uv/).
 
-1. **What doesn't the model already know?** A fast scan with no training. It measures how surprised the model is by each example and splits the data into *already known*, *learnable* and *likely noise*. It also flags duplicates and gives a calibrated estimate of whether the model has seen this data before.
-2. **What does it change?** A short LoRA fine-tune, scored before and after on target, adjacent and general benchmarks. The result is reported against a generic-data control and with confidence intervals. Side effects are shown as prominently as gains.
-3. **How much is enough?** A scaling curve of gain against data size, including the point where more data stops paying off.
-4. **Which parts matter?** Benchmark-contamination detection (raw gain vs. clean gain) and cluster-level contributions.
+```bash
+git clone https://github.com/EmilFabel04/dvx.git
+cd dvx
+uv sync
+```
 
-Every run also writes a structured record to a local **corpus** of "data about data value". Over time that corpus is meant to train a predictor that estimates impact without a training run.
+Models, benchmarks and the control dataset come from the Hugging Face Hub on first use and are cached there afterwards.
 
-## Principles
+## A first run
 
-- **No single "intelligence score."** Every number carries its model, its context and its uncertainty.
-- **Reproducible.** Inputs, model revisions, seeds and versions are pinned and recorded.
-- **Honest about weak signals.** A signal that can't be validated is reported as inconclusive.
+Make a dataset: 2,000 examples from the MedMCQA train split, in dvx's JSONL format. (MedMCQA's eval items come from its validation split.)
 
-## v1 scope
+```bash
+uv run python scripts/make_medmcqa_sample.py --n 2000 --seed 0 --out data/medmcqa_train_2k.jsonl
+```
 
-- Text datasets in prompt/response or chat format.
-- Medical QA as the first evaluation domain.
-- Open models of about 0.5–3B parameters on a laptop (Apple Silicon via PyTorch MPS), with validation on about 8B models via CUDA.
-- A CLI and a Python library. Dollar values are explicitly out of scope for v1.
+Scan it (part 1 only, no training):
+
+```bash
+uv run dvx scan data/medmcqa_train_2k.jsonl --model Qwen/Qwen3-1.7B-Base
+```
+
+Measure its impact with the quick profile (part 1, then part 2):
+
+```bash
+uv run dvx run data/medmcqa_train_2k.jsonl --model Qwen/Qwen3-1.7B-Base --domain medical-qa \
+    --profile quick --type medical-qa
+```
+
+Each step prints a progress line to stderr and saves its output under `.dvx/runs/<run_id>/steps/`. A stopped run continues from its last finished step:
+
+```bash
+uv run dvx resume 20261101-201145-8c7ff65f
+```
+
+Re-render a finished run's report, and inspect the corpus:
+
+```bash
+uv run dvx report 20261101-201145-8c7ff65f
+uv run dvx corpus list
+uv run dvx corpus export corpus-export.jsonl
+```
+
+Runs and the corpus live in `.dvx/` (override it with `--home` or `$DVX_HOME`). Other options for `scan` and `run`:
+
+- `--revision` pins the model revision;
+- `--reference` picks the reference model for the novelty check;
+- `--unseen-after YYYY-MM-DD` sets the date after which text is unseen by the model.
+
+These are for `run` only:
+
+- `--date-range START END` records when the data was written;
+- `--device cuda|mps|cpu` overrides the device.
+
+### Input format
+
+One JSON object per line, either `{"prompt": ..., "response": ...}` (optionally with `"system"`) or a single-turn `{"messages": [...]}` with an optional system message, then one user and one assistant message. Every model sees the same plain-text format: the system text and the prompt joined by a blank line, a blank line, then the response. Chat templates are not used.
+
+### Models
+
+The registry pins the pretrained (Base) Qwen3 checkpoints, Apache-2.0: `Qwen/Qwen3-0.6B-Base`, `Qwen/Qwen3-1.7B-Base`, `Qwen/Qwen3-4B-Base` and `Qwen/Qwen3-8B-Base`. Each one's novelty reference is the next size up. Other Hub models work too: pass `--unseen-after` and `--reference`, and dvx records the commits it loaded. Post-trained (chat) checkpoints are not registered, because their losses reflect answer style rather than content.
+
+## What the quick report contains
+
+**Part 1: data checks (no training).** These run on up to 20,000 examples; above that, a fixed random sample is used and the report says so.
+
+- **Novelty.** Each example's response loss under the target model and under a larger reference model splits the data into *known*, *learnable* and *noise*. A reliability gate marks the split **inconclusive** when the reference's loss is below the target's on fewer than half the examples, or when the reference cannot tell true prompt/response pairs from mismatched ones (paired discrimination below 0.6). The report always shows both reliability numbers, the thresholds, loss quartiles and example items.
+- **Prior exposure.** A Min-K% Prob membership score is calibrated on Wikipedia articles from before and after the model's cutoff. The estimate comes with its calibration AUC and is **inconclusive** below 0.6.
+- **Duplicates.** Exact and MinHash near-duplicates.
+- **Contamination.** Examples that contain an evaluation item (13-gram coverage and question phrases, robust to "A." / "(B)" option labels) are flagged, and the warning sits next to the gains.
+
+**Part 2: impact (quick profile).**
+
+- **Base model check.** Before any training, the base model must beat chance by at least 5 percentage points on average on the target benchmarks. Chance is the larger of 1/k and the most common answer's share. Otherwise the run stops and recommends a larger model.
+- **Fine-tunes.** One LoRA fine-tune on up to 2,000 of your examples, and one on the same number of generic instruction examples (Databricks Dolly 15k, the control).
+- **Evaluation.** Base, control and tuned models are scored on the pinned `medical-qa` suite (v2):
+  - target: MedQA, MedMCQA and PubMedQA;
+  - adjacent: four MMLU biology and chemistry subjects;
+  - side effects: ARC-Challenge and four other MMLU subjects.
+  Scoring is plain-text 5-shot log-likelihood. The shots come from rows disjoint from the eval items, and their IDs are recorded.
+- **The headline** is the **data-specific gain** (tuned − control) on the target group, in percentage points with a 95% bootstrap confidence interval. Raw gain (tuned − base) and the format effect (control − base) are shown next to it. A group whose interval lies wholly below zero is called out as a regression, right after the headline.
+
+**Not in the quick report (Milestone 2):**
+
+- multiple training seeds (the `full` profile);
+- the scaling curve (part 3);
+- the clean-gain rerun without contaminated examples, and cluster contributions (part 4);
+- the evaluation of larger sibling models for the conversion anchor.
+
+There is no price or currency output.
+
+## How far to trust a result
+
+- **Uncertainty.** The quick profile trains **one seed**. Its confidence intervals cover question sampling only, not training randomness, so treat a small gain with a narrow interval with care.
+- **Reproducibility.** Each record pins what a third party needs to rerun the measurement: the dataset content hash, model and reference revisions, the eval suite version (which pins benchmark revisions) and shot IDs, seeds, library versions, the dvx version and source commit (with a dirty flag), the calibration texts' SHA-256 and fetch date, and the hardware. Reruns are not bit-identical, though. Training and scoring on Apple GPUs (MPS) are not deterministic, the calibration texts are re-fetched from a changing Wikipedia unless the cache is kept, and a different device or library version can move the numbers. Compare reruns by their confidence intervals, not their digits.
+- **Small models.** A result for a 1.7B model is not evidence about an 8B model.
+
+## Running on a 16 GB Apple Silicon Mac
+
+dvx runs on MPS, CUDA and CPU from one codebase, loads one model at a time, and bounds scoring and training memory. Measured wall times and memory for a quick run on an M5 with 16 GB are in [`docs/timings-m5.md`](docs/timings-m5.md). That first measurement predates the 5-shot evaluation, which makes each eval pass several times longer, and will be updated after the next run. One-time costs include downloading the models and fetching the Wikipedia calibration texts (about 20 minutes the first time).
+
+## Licenses
+
+dvx is [Apache-2.0](LICENSE). It redistributes no data or weights. Everything below is downloaded at runtime and used under its own license:
+
+- the control set, Databricks Dolly 15k, is CC BY-SA 3.0;
+- the benchmarks (MedQA, MedMCQA, PubMedQA, MMLU and ARC) are under their own licenses;
+- the Qwen3 models are Apache-2.0;
+- the calibration texts are Wikipedia article intros, CC BY-SA, cached locally.
+
+Check each license before you redistribute anything a run produces.
 
 ## Development
 
 ```bash
 uv sync --extra dev
-uv run pytest
+uv run pytest            # fast tests; a tiny random model on CPU
+uv run pytest -m slow    # real models and Hub downloads
 uv run ruff check .
 ```
-
-## License
-
-[Apache-2.0](LICENSE)
