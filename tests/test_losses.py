@@ -150,3 +150,24 @@ def test_release_cached_memory_once_per_scoring_call(tiny, monkeypatch):
     response_losses(model, tok, _exs(), batch_size=2)
     token_logprobs(model, tok, ["hello world", "another text"], batch_size=1)
     assert [d.type for d in calls] == ["cpu", "cpu"]
+
+
+def test_target_logprobs_falls_back_for_unlisted_model_type(tiny, monkeypatch):
+    import torch
+
+    from dvx.scan import losses
+
+    model, tok = tiny
+    ids, mask = _padded_batch(tok, [2 * losses._CHUNK + 6, 9])
+    monkeypatch.setattr(model.config, "model_type", "gemma2")
+    widths = []
+    hook = model.get_output_embeddings().register_forward_hook(
+        lambda mod, inp, out: widths.append(out.shape[1])
+    )
+    try:
+        with torch.no_grad():
+            got = losses._target_logprobs(model, ids, mask)
+    finally:
+        hook.remove()
+    assert widths == [ids.shape[1]]  # one full-sequence head call: the fallback
+    assert torch.allclose(got, _reference_logprobs(model, ids, mask), atol=1e-5)

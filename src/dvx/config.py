@@ -24,6 +24,7 @@ class TrainConfig:
         "up_proj",
         "down_proj",
     )
+    gradient_checkpointing: bool = True
 
 
 @dataclass(frozen=True)

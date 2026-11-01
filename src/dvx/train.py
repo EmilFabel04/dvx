@@ -62,7 +62,9 @@ def finetune_lora(
     `cfg.epochs` passes in micro-batches of `cfg.micro_batch_size`, with
     gradients accumulated over `cfg.grad_accum` micro-batches per optimizer step.
     The learning rate warms up linearly for ceil(warmup_ratio * steps) steps and
-    then decays linearly to 0.
+    then decays linearly to 0. With `cfg.gradient_checkpointing`, decoder activations
+    are recomputed in the backward pass instead of stored, which trades about one extra
+    forward pass for memory and leaves the result unchanged.
 
     `est_flops` is the 6 * N * D approximation, where N is the parameter count of
     the base model only (measured before the LoRA wrapper adds adapter weights)
@@ -74,6 +76,9 @@ def finetune_lora(
     torch.manual_seed(seed)
 
     n_params = count_params(model)
+    if cfg.gradient_checkpointing:
+        # Non-reentrant, so frozen inputs need no grad hooks and dropout RNG is replayed.
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     peft_model = get_peft_model(
         model,
         LoraConfig(
@@ -119,7 +124,9 @@ def finetune_lora(
         step_loss = 0.0
         for batch in group:
             ids, labels, mask = _collate(batch, pad_id, device, cfg.max_seq_len)
-            loss = peft_model(input_ids=ids, attention_mask=mask, labels=labels).loss
+            loss = peft_model(
+                input_ids=ids, attention_mask=mask, labels=labels, use_cache=False
+            ).loss
             (loss / len(group)).backward()
             step_loss += loss.item() / len(group)
             tokens_trained += int(mask.sum().item())

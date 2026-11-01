@@ -88,3 +88,27 @@ def test_finetune_releases_cached_memory_once(monkeypatch):
     monkeypatch.setattr(dvx.train, "release_cached_memory", calls.append)
     finetune_lora(m, tok, _exs(4), TrainConfig(epochs=1, max_seq_len=64), seed=0)
     assert [d.type for d in calls] == ["cpu"]
+
+
+def _one_step(checkpointing):
+    m, tok = load_model(TINY, TINY_REV, "cpu")
+    use_cache = []  # what the decoder is asked for; True would warn under checkpointing
+    m.get_decoder().register_forward_pre_hook(
+        lambda mod, args, kwargs: use_cache.append(kwargs.get("use_cache")), with_kwargs=True
+    )
+    cfg = TrainConfig(lr=1e-2, max_seq_len=64, gradient_checkpointing=checkpointing)
+    tuned, st = finetune_lora(m, tok, _exs(8), cfg, seed=0)  # 8 = micro 4 x accum 2
+    assert st.steps == 1 and m.is_gradient_checkpointing is checkpointing
+    assert use_cache == [False, False]  # one forward per micro-batch, KV cache off
+    lora = {n: p.detach().clone() for n, p in tuned.named_parameters() if p.requires_grad}
+    return st.final_loss, lora
+
+
+def test_gradient_checkpointing_matches_plain_training():
+    # Default lora_dropout (0.05): non-reentrant checkpointing restores the RNG state
+    # when it recomputes, so dropout masks match.
+    loss_on, lora_on = _one_step(True)
+    loss_off, lora_off = _one_step(False)
+    assert abs(loss_on - loss_off) < 1e-6
+    assert lora_on.keys() == lora_off.keys() and lora_on
+    assert all(torch.allclose(lora_on[n], lora_off[n], atol=1e-6) for n in lora_on)

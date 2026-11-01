@@ -27,3 +27,7 @@ def test_scan_defaults():
     assert (s.min_k, s.exposure_min_auc, s.calibration_per_side) == (0.2, 0.6, 200)
     assert (s.minhash_threshold, s.shingle_words, s.num_perm) == (0.8, 5, 128)
     assert (s.score_max_len, s.batch_size) == (1024, 8)
+
+
+def test_gradient_checkpointing_on_by_default():
+    assert TrainConfig().gradient_checkpointing is True

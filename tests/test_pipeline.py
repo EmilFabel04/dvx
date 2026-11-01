@@ -328,3 +328,10 @@ def test_bad_dataset_fails_before_loading(tmp_path, monkeypatch):
         with pytest.raises(DatasetFormatError, match="line 1"):
             entry(req, calibration_fetcher=fail, control_loader=fail)
     assert not (tmp_path / "home").exists()
+
+
+def test_saved_profile_without_gradient_checkpointing_loads_with_default():
+    saved = dataclasses.asdict(PROFILES["quick"])
+    del saved["train"]["gradient_checkpointing"]  # request.json written before the field
+    profile = pipeline._profile_from_json(json.loads(json.dumps(saved)))
+    assert profile == PROFILES["quick"] and profile.train.gradient_checkpointing is True
