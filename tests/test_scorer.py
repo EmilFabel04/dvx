@@ -73,3 +73,14 @@ def test_real_tiny_deterministic(tiny):
     b = score_mcq(model, tok, items, batch_size=2, max_len=32)
     assert a.dtype == bool and len(a) == 3
     assert np.array_equal(a, b)
+
+
+def test_score_mcq_releases_cached_memory_once(tiny, monkeypatch):
+    import dvx.evals.scorer
+
+    _, tok = tiny
+    calls = []
+    monkeypatch.setattr(dvx.evals.scorer, "release_cached_memory", calls.append)
+    items = [MCQItem("b", str(i), "Q?", ("x", "y"), 0) for i in range(3)]
+    score_mcq(StubLM(tok), tok, items, batch_size=2)
+    assert [d.type for d in calls] == ["cpu"]

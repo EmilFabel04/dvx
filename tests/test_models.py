@@ -1,5 +1,6 @@
 from datetime import date
 
+import pytest
 import torch
 
 from dvx.models import REGISTRY, model_info, pick_device, release
@@ -47,3 +48,25 @@ def test_release_frees_parameters(tiny):
     model, _ = tiny
     release(model)
     assert all(p.is_meta for p in model.parameters())
+
+
+@pytest.mark.parametrize("device", ["mps", "cuda", "cpu"])
+def test_release_cached_memory_empties_that_device_cache(device, monkeypatch):
+    from dvx.models import release_cached_memory
+
+    calls = []
+    monkeypatch.setattr(torch.mps, "empty_cache", lambda: calls.append("mps"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("cuda"))
+    release_cached_memory(torch.device(device))
+    release_cached_memory(device)
+    assert calls == ([device, device] if device != "cpu" else [])
+
+
+def test_release_empties_cache_through_helper(tiny, monkeypatch):
+    import dvx.models
+
+    model, _ = tiny
+    calls = []
+    monkeypatch.setattr(dvx.models, "release_cached_memory", calls.append)
+    release(model)
+    assert [d.type for d in calls] == ["cpu"]

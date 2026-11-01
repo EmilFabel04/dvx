@@ -2,17 +2,18 @@
 
 import numpy as np
 import torch
+from torch import nn
 from transformers import PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from dvx.data import Example
-from dvx.prompting import IGNORE, encode_sft
+from dvx.models import release_cached_memory, split_decoder_head
+from dvx.prompting import IGNORE, encode_sft, padded_width
 
-_CHUNK = 128  # sequence positions per float32 log-prob chunk
+_CHUNK = 32  # sequence positions projected to the vocabulary, and upcast, at a time
 
 
-def _pad(seqs: list[list[int]], value: int, device: torch.device) -> torch.Tensor:
-    width = max(len(s) for s in seqs)
+def _pad(seqs: list[list[int]], value: int, width: int, device: torch.device) -> torch.Tensor:
     return torch.tensor([s + [value] * (width - len(s)) for s in seqs], device=device)
 
 
@@ -26,15 +27,27 @@ def _target_logprobs(
 ) -> torch.Tensor:
     """Log-prob of each next token, shape [B, T-1], in float32.
 
-    Computed as gather - logsumexp in sequence chunks, so the full float32
-    log_softmax over the vocabulary is never materialized.
+    The decoder runs once, and its final hidden states are projected to the
+    vocabulary _CHUNK positions at a time, each chunk reduced to gather - logsumexp
+    in float32. Neither full-sequence logits nor a float32 log_softmax over the
+    vocabulary is materialized. A model that dvx.models.split_decoder_head can't split
+    (an unlisted model type, or no separable decoder and output head) falls back to
+    full-sequence logits, still upcast one chunk at a time.
     """
-    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    split = split_decoder_head(model)
+    if split is None:
+        states = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        head: nn.Module = nn.Identity()
+    else:
+        decoder, head = split
+        states = decoder(
+            input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+        ).last_hidden_state
     targets = input_ids[:, 1:]
     parts = []
     for start in range(0, targets.shape[1], _CHUNK):
         end = min(start + _CHUNK, targets.shape[1])
-        chunk = logits[:, start:end].float()
+        chunk = head(states[:, start:end]).float()
         picked = chunk.gather(-1, targets[:, start:end].unsqueeze(-1)).squeeze(-1)
         parts.append(picked - torch.logsumexp(chunk, dim=-1))
     return torch.cat(parts, dim=1)
@@ -57,14 +70,16 @@ def response_losses(
     out = [0.0] * len(encoded)
     for idx in _length_sorted_batches([len(e.input_ids) for e in encoded], batch_size):
         chunk = [encoded[i] for i in idx]
-        ids = _pad([e.input_ids for e in chunk], tokenizer.pad_token_id, device)
-        labels = _pad([e.labels for e in chunk], IGNORE, device)
-        mask = _pad([[1] * len(e.input_ids) for e in chunk], 0, device)
+        width = padded_width(max(len(e.input_ids) for e in chunk), max_len)
+        ids = _pad([e.input_ids for e in chunk], tokenizer.pad_token_id, width, device)
+        labels = _pad([e.labels for e in chunk], IGNORE, width, device)
+        mask = _pad([[1] * len(e.input_ids) for e in chunk], 0, width, device)
         picked = _target_logprobs(model, ids, mask)
         valid = labels[:, 1:] != IGNORE
         nll = -(picked * valid).sum(-1) / valid.sum(-1).clamp(min=1)
         for i, v in zip(idx, nll.tolist(), strict=True):
             out[i] = v
+    release_cached_memory(device)
     return out
 
 
@@ -85,9 +100,11 @@ def token_logprobs(
     out: list[np.ndarray] = [np.zeros(0, dtype=np.float32)] * len(encoded)
     for idx in _length_sorted_batches([len(e) for e in encoded], batch_size):
         chunk = [encoded[i] for i in idx]
-        ids = _pad(chunk, tokenizer.pad_token_id, device)
-        mask = _pad([[1] * len(c) for c in chunk], 0, device)
+        width = padded_width(max(len(c) for c in chunk), max_len)
+        ids = _pad(chunk, tokenizer.pad_token_id, width, device)
+        mask = _pad([[1] * len(c) for c in chunk], 0, width, device)
         picked = _target_logprobs(model, ids, mask)
         for i, row, c in zip(idx, picked, chunk, strict=True):
             out[i] = row[: max(len(c) - 1, 0)].cpu().numpy()
+    release_cached_memory(device)
     return out

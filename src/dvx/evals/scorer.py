@@ -6,6 +6,7 @@ from transformers import PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from dvx.evals.registry import MCQItem
+from dvx.models import release_cached_memory
 from dvx.prompting import encode_prompt_text, render_mcq
 
 LETTERS = "ABCDEFGH"
@@ -58,4 +59,5 @@ def score_mcq(
             letter_ids = letter_token_ids(tokenizer, len(items[i].options))
             scores = [last[row, lid].max().item() for lid in letter_ids]
             correct[i] = int(np.argmax(scores)) == items[i].answer
+    release_cached_memory(device)
     return correct

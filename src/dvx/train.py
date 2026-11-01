@@ -7,14 +7,19 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
+from torch import nn
+from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from dvx.config import TrainConfig
 from dvx.data import Example
-from dvx.models import count_params
-from dvx.prompting import IGNORE, EncodedExample, encode_sft
+from dvx.models import count_params, release_cached_memory, split_decoder_head
+from dvx.prompting import IGNORE, EncodedExample, encode_sft, padded_width
+
+_LOSS_CHUNK = 32  # sequence positions per vocabulary projection in the training loss
 
 
 @dataclass(frozen=True)
@@ -32,9 +37,9 @@ class TrainStats:
 
 
 def _collate(
-    batch: list[EncodedExample], pad_id: int, device: torch.device
+    batch: list[EncodedExample], pad_id: int, device: torch.device, max_len: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    width = max(len(e.input_ids) for e in batch)
+    width = padded_width(max(len(e.input_ids) for e in batch), max_len)
     ids, labels, mask = [], [], []
     for e in batch:
         pad = width - len(e.input_ids)
@@ -46,6 +51,87 @@ def _collate(
         torch.tensor(labels, device=device),
         torch.tensor(mask, device=device),
     )
+
+
+def _chunk_nll_sum(head: nn.Module, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    logits = head(hidden).float()
+    return F.cross_entropy(
+        logits.flatten(0, 1), targets.flatten(), ignore_index=IGNORE, reduction="sum"
+    )
+
+
+def _sft_loss(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Mean next-token NLL over the non-IGNORE labels: HF's causal-LM loss.
+
+    For a split-head model (see split_decoder_head) the decoder runs once, then the head
+    and float32 cross-entropy run _LOSS_CHUNK positions at a time, each chunk under
+    activation checkpointing. So the [B, T, V] logits, their float32 copy, log-softmax
+    and gradient never exist whole: each chunk's logits are rebuilt in backward. Other
+    models use the model's own loss.
+    """
+    split = split_decoder_head(model)
+    if split is None:
+        return model(
+            input_ids=input_ids, attention_mask=attention_mask, labels=labels, use_cache=False
+        ).loss
+    decoder, head = split
+    hidden = decoder(
+        input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+    ).last_hidden_state
+    targets = labels[:, 1:]
+    total = hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, targets.shape[1], _LOSS_CHUNK):
+        end = min(start + _LOSS_CHUNK, targets.shape[1])
+        total = total + checkpoint(
+            _chunk_nll_sum, head, hidden[:, start:end], targets[:, start:end], use_reentrant=False
+        )
+    return total / (targets != IGNORE).sum()
+
+
+def _optimize(
+    peft_model: PeftModel,
+    groups: list[list[list[EncodedExample]]],
+    cfg: TrainConfig,
+    steps: int,
+    pad_id: int,
+    device: torch.device,
+) -> tuple[int, float]:
+    """One AdamW step per group of micro-batches; returns (tokens_trained, final_loss).
+
+    The optimizer, its state and the last batch are local, and gradients are set to
+    None at the end, so all of it is freed when this returns.
+    """
+    warmup = math.ceil(cfg.warmup_ratio * steps)
+
+    def lr_scale(step: int) -> float:
+        if step < warmup:
+            return (step + 1) / warmup
+        return max(0.0, (steps - step) / max(1, steps - warmup))
+
+    params = [p for p in peft_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
+    tokens_trained = 0
+    final_loss = float("nan")
+    for group in groups:
+        optimizer.zero_grad()
+        step_loss = 0.0
+        for batch in group:
+            ids, labels, mask = _collate(batch, pad_id, device, cfg.max_seq_len)
+            loss = _sft_loss(peft_model, ids, mask, labels)
+            (loss / len(group)).backward()
+            step_loss += loss.item() / len(group)
+            tokens_trained += int(mask.sum().item())
+        optimizer.step()
+        scheduler.step()
+        final_loss = float(step_loss)
+    optimizer.zero_grad(set_to_none=True)
+    return tokens_trained, final_loss
 
 
 def finetune_lora(
@@ -61,8 +147,11 @@ def finetune_lora(
     Examples are shuffled once with `random.Random(seed)`, then iterated for
     `cfg.epochs` passes in micro-batches of `cfg.micro_batch_size`, with
     gradients accumulated over `cfg.grad_accum` micro-batches per optimizer step.
+    Each micro-batch's loss is HF's causal-LM loss, computed in chunks by `_sft_loss`.
     The learning rate warms up linearly for ceil(warmup_ratio * steps) steps and
-    then decays linearly to 0.
+    then decays linearly to 0. With `cfg.gradient_checkpointing`, decoder activations
+    are recomputed in the backward pass instead of stored, which trades about one extra
+    forward pass for memory and leaves the result unchanged.
 
     `est_flops` is the 6 * N * D approximation, where N is the parameter count of
     the base model only (measured before the LoRA wrapper adds adapter weights)
@@ -74,6 +163,10 @@ def finetune_lora(
     torch.manual_seed(seed)
 
     n_params = count_params(model)
+    if cfg.gradient_checkpointing:
+        # Non-reentrant: frozen inputs need no input-grad hook (peft adds one anyway).
+        # torch.utils.checkpoint preserves RNG state on recompute by default.
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     peft_model = get_peft_model(
         model,
         LoraConfig(
@@ -97,37 +190,16 @@ def finetune_lora(
     groups = [micro[i : i + cfg.grad_accum] for i in range(0, len(micro), cfg.grad_accum)]
     steps = math.ceil(len(examples) * cfg.epochs / (cfg.micro_batch_size * cfg.grad_accum))
     assert steps == len(groups)
-    warmup = math.ceil(cfg.warmup_ratio * steps)
-
-    def lr_scale(step: int) -> float:
-        if step < warmup:
-            return (step + 1) / warmup
-        return max(0.0, (steps - step) / max(1, steps - warmup))
-
-    params = [p for p in peft_model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
 
     device = next(peft_model.parameters()).device
-    pad_id = tokenizer.pad_token_id
-    tokens_trained = 0
-    final_loss = float("nan")
     start = time.perf_counter()
     peft_model.train()
-    for group in groups:
-        optimizer.zero_grad()
-        step_loss = 0.0
-        for batch in group:
-            ids, labels, mask = _collate(batch, pad_id, device)
-            loss = peft_model(input_ids=ids, attention_mask=mask, labels=labels).loss
-            (loss / len(group)).backward()
-            step_loss += loss.item() / len(group)
-            tokens_trained += int(mask.sum().item())
-        optimizer.step()
-        scheduler.step()
-        final_loss = float(step_loss)
+    tokens_trained, final_loss = _optimize(
+        peft_model, groups, cfg, steps, tokenizer.pad_token_id, device
+    )
     wall = time.perf_counter() - start
     peft_model.eval()
+    release_cached_memory(device)  # after _optimize's optimizer, grads and batches are gone
 
     stats = TrainStats(
         n_examples=len(examples),
