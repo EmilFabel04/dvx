@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date
 
 import torch
+from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -69,6 +70,26 @@ def load_model(
     model.to(device)
     model.eval()
     return model, tokenizer
+
+
+# Model types whose logits are exactly lm_head(final hidden state); others may transform
+# logits after the head (e.g. softcapping), so they take the full-logits path.
+SPLIT_HEAD_MODEL_TYPES = frozenset({"llama", "mistral", "qwen2", "qwen3"})
+
+
+def split_decoder_head(model: PreTrainedModel) -> tuple[nn.Module, nn.Module] | None:
+    """The model's decoder and output embedding, if its logits are the head applied to
+    the decoder's final hidden states; None if the model can't be split that way or its
+    type isn't in SPLIT_HEAD_MODEL_TYPES."""
+    if getattr(getattr(model, "config", None), "model_type", None) not in SPLIT_HEAD_MODEL_TYPES:
+        return None
+    try:
+        decoder, head = model.get_decoder(), model.get_output_embeddings()
+    except (AttributeError, NotImplementedError):
+        return None
+    if decoder is None or head is None or any(m is head for m in decoder.modules()):
+        return None
+    return decoder, head
 
 
 def count_params(model: PreTrainedModel) -> int:

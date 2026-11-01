@@ -7,13 +7,10 @@ from transformers import PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from dvx.data import Example
-from dvx.models import release_cached_memory
+from dvx.models import release_cached_memory, split_decoder_head
 from dvx.prompting import IGNORE, encode_sft, padded_width
 
 _CHUNK = 32  # sequence positions projected to the vocabulary, and upcast, at a time
-# Model types whose logits are exactly lm_head(final hidden state); others may transform
-# logits after the head (e.g. softcapping), so they take the full-logits path.
-SPLIT_HEAD_MODEL_TYPES = frozenset({"llama", "mistral", "qwen2", "qwen3"})
 
 
 def _pad(seqs: list[list[int]], value: int, width: int, device: torch.device) -> torch.Tensor:
@@ -25,21 +22,6 @@ def _length_sorted_batches(lengths: list[int], batch_size: int) -> list[list[int
     return [order[i : i + batch_size] for i in range(0, len(order), batch_size)]
 
 
-def _decoder_and_head(model: PreTrainedModel) -> tuple[nn.Module, nn.Module] | None:
-    """The model's decoder and output embedding, if its logits are the head applied to
-    the decoder's final hidden states; None if the model can't be split that way or its
-    type isn't in SPLIT_HEAD_MODEL_TYPES."""
-    if getattr(getattr(model, "config", None), "model_type", None) not in SPLIT_HEAD_MODEL_TYPES:
-        return None
-    try:
-        decoder, head = model.get_decoder(), model.get_output_embeddings()
-    except (AttributeError, NotImplementedError):
-        return None
-    if decoder is None or head is None or any(m is head for m in decoder.modules()):
-        return None
-    return decoder, head
-
-
 def _target_logprobs(
     model: PreTrainedModel, input_ids: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
@@ -48,11 +30,11 @@ def _target_logprobs(
     The decoder runs once, and its final hidden states are projected to the
     vocabulary _CHUNK positions at a time, each chunk reduced to gather - logsumexp
     in float32. Neither full-sequence logits nor a float32 log_softmax over the
-    vocabulary is materialized. Any other model (not in SPLIT_HEAD_MODEL_TYPES, or not
-    splittable into decoder and output head) falls back to full-sequence logits, still
-    upcast one chunk at a time.
+    vocabulary is materialized. A model that dvx.models.split_decoder_head can't split
+    (an unlisted model type, or no separable decoder and output head) falls back to
+    full-sequence logits, still upcast one chunk at a time.
     """
-    split = _decoder_and_head(model)
+    split = split_decoder_head(model)
     if split is None:
         states = model(input_ids=input_ids, attention_mask=attention_mask).logits
         head: nn.Module = nn.Identity()

@@ -112,3 +112,71 @@ def test_gradient_checkpointing_matches_plain_training():
     assert abs(loss_on - loss_off) < 1e-6
     assert lora_on.keys() == lora_off.keys() and lora_on
     assert all(torch.allclose(lora_on[n], lora_off[n], atol=1e-6) for n in lora_on)
+
+
+def _sft_batch(tok, lengths, n_prompt):
+    """Right-padded ids, mask and labels; the first n_prompt tokens of each row are IGNORE."""
+    from dvx.prompting import IGNORE
+
+    gen = torch.Generator().manual_seed(0)
+    width = max(lengths)
+    ids = torch.full((len(lengths), width), tok.pad_token_id)
+    labels = torch.full((len(lengths), width), IGNORE)
+    mask = torch.zeros(len(lengths), width, dtype=torch.long)
+    for row, n in enumerate(lengths):
+        ids[row, :n] = torch.randint(3, len(tok), (n,), generator=gen)
+        labels[row, n_prompt:n] = ids[row, n_prompt:n]
+        mask[row, :n] = 1
+    return ids, mask, labels
+
+
+def _loss_and_grads(model, loss_fn):
+    model.zero_grad()
+    loss = loss_fn()
+    loss.backward()
+    grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+    return loss.detach(), grads
+
+
+def test_sft_loss_matches_hf_loss_and_grads_in_chunks():
+    from dvx import train
+
+    m, tok = load_model(TINY, TINY_REV, "cpu")
+    ids, mask, labels = _sft_batch(tok, [2 * train._LOSS_CHUNK + 6, 9], n_prompt=5)
+    widths = []  # every head call, forward and backward recompute
+    m.lm_head.register_forward_hook(lambda mod, inp, out: widths.append(out.shape[1]))
+    got, got_grads = _loss_and_grads(m, lambda: train._sft_loss(m, ids, mask, labels))
+    assert widths and max(widths) <= train._LOSS_CHUNK  # never [B, T, V] logits
+    widths.clear()
+    ref, ref_grads = _loss_and_grads(
+        m, lambda: m(input_ids=ids, attention_mask=mask, labels=labels).loss
+    )
+    assert widths == [ids.shape[1]]
+    assert got.dtype == torch.float32 and torch.allclose(got, ref, rtol=1e-6, atol=0)
+    assert got_grads.keys() == ref_grads.keys() and got_grads
+    assert all(torch.allclose(got_grads[n], ref_grads[n], rtol=1e-4, atol=1e-7) for n in ref_grads)
+
+
+def test_sft_loss_falls_back_to_hf_loss_for_unlisted_model_type(monkeypatch):
+    from dvx import train
+
+    m, tok = load_model(TINY, TINY_REV, "cpu")
+    ids, mask, labels = _sft_batch(tok, [2 * train._LOSS_CHUNK + 6, 9], n_prompt=5)
+    monkeypatch.setattr(m.config, "model_type", "gemma2")
+    widths = []
+    m.lm_head.register_forward_hook(lambda mod, inp, out: widths.append(out.shape[1]))
+    got = train._sft_loss(m, ids, mask, labels)
+    assert widths == [ids.shape[1]]  # one full-sequence head call: HF's own loss
+    ref = m(input_ids=ids, attention_mask=mask, labels=labels).loss
+    assert torch.allclose(got, ref, rtol=1e-6, atol=0)
+
+
+def test_finetune_never_projects_full_sequence():
+    from dvx import train
+
+    m, tok = load_model(TINY, TINY_REV, "cpu")
+    widths = []
+    m.lm_head.register_forward_hook(lambda mod, inp, out: widths.append(out.shape[1]))
+    exs = [Example("Q", "word " * 60, None, i) for i in range(8)]  # longer than a chunk
+    finetune_lora(m, tok, exs, TrainConfig(epochs=1, max_seq_len=128), seed=0)
+    assert widths and max(widths) <= train._LOSS_CHUNK
