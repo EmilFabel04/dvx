@@ -191,6 +191,26 @@ def test_evaluation_protocol_and_shots_recorded(tmp_path):
         assert saved["n_truncated"] == ev["n_truncated"]
 
 
+def test_baseline_chance_is_max_of_uniform_and_majority(tmp_path):
+    rec = start_run(make_request(tmp_path), **overrides())
+    # ITEMS have answers A and B: majority 50% beats 1/k = 25%.
+    targets = ("medqa", "medmcqa", "pubmedqa")
+    assert rec.results["baseline"]["chance_pp"] == dict.fromkeys(targets, 50.0)
+
+
+def test_eval_steps_store_predicted_letters(tmp_path):
+    req = make_request(tmp_path)
+    rec = start_run(req, **overrides())
+    for step in ("eval_base", "tuned_s0", "control_s0"):
+        saved = json.loads((run_dir(req, rec) / "steps" / f"{step}.json").read_text())
+        for name, items in ITEMS.items():
+            letters = saved["predicted"][name]
+            assert len(letters) == len(items) and set(letters) <= set("ABCD")
+            assert saved["correct"][name] == [
+                "ABCD".index(p) == it.answer for p, it in zip(letters, items, strict=True)
+            ]
+
+
 def test_eval_prompts_carry_the_shots(tmp_path, monkeypatch):
     calls = []
     real = pipeline.score_mcq

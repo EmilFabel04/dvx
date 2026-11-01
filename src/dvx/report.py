@@ -30,11 +30,18 @@ def _ordinal(x: float) -> str:
     return f"{n}{suffix}"
 
 
+def _ci(e: dict) -> str:
+    return f"95% CI {e['ci_low']:+.1f} to {e['ci_high']:+.1f}"
+
+
 def fmt_delta(e: dict) -> str:
-    """Format an Estimate of a delta, in percentage points with its 95% CI."""
-    text = f"{e['value']:+.1f} pp (95% CI {e['ci_low']:+.1f} to {e['ci_high']:+.1f})"
+    """Format an Estimate of a delta, in percentage points with its 95% CI; a CI that
+    includes zero, or lies wholly below it, is labelled."""
+    text = f"{e['value']:+.1f} pp ({_ci(e)})"
     if e["ci_low"] <= 0 <= e["ci_high"]:
         text += " — not distinguishable from zero"
+    elif e["ci_high"] < 0:
+        text += " — regression"
     return text
 
 
@@ -49,6 +56,27 @@ def _headline(record: dict) -> str | None:
     return "Data-specific gain on target benchmarks: " + fmt_delta(
         impact["delta_data_specific"]["target"]
     )
+
+
+def _seeds(record: dict) -> str:
+    n = len(record["seeds"])
+    return "one training seed" if n == 1 else f"{n} training seeds"
+
+
+def _regression_lines(record: dict) -> list[str]:
+    """One line per group whose data-specific delta is wholly below zero."""
+    impact = record["results"].get("impact")
+    if not impact:
+        return []
+    lines = []
+    for g in GROUPS:
+        e = impact["delta_data_specific"][g]
+        if e["ci_high"] < 0:
+            lines.append(
+                f"Regression vs. control: {g} {e['value']:+.1f} pp ({_ci(e)}; {_seeds(record)}). "
+                f"Versus the untuned base: {impact['delta_raw'][g]['value']:+.1f} pp."
+            )
+    return lines
 
 
 def _stop_line(record: dict) -> str | None:
@@ -66,8 +94,9 @@ def _contamination_warning(record: dict) -> str | None:
     if not c or c["n_flagged"] <= 0:
         return None
     by = ", ".join(f"{name}: {n}" for name, n in c["by_benchmark"].items())
+    verb = "overlaps" if c["n_flagged"] == 1 else "overlap"
     return (
-        f"WARNING: {c['n_flagged']:,} examples overlap with evaluation items ({by}). "
+        f"WARNING: {_count(c['n_flagged'], 'example')} {verb} with evaluation items ({by}). "
         "Gains on those benchmarks may be inflated."
     )
 
@@ -76,10 +105,13 @@ def _truncation_line(record: dict) -> str | None:
     impact = record["results"].get("impact")
     if not impact:
         return None
-    n = impact["train"]["tuned"]["n_truncated"]
-    if n <= 0:
+    tuned, control = (impact["train"][arm]["n_truncated"] for arm in ("tuned", "control"))
+    if tuned <= 0 and control <= 0:
         return None
-    return f"{n:,} training examples were truncated to {record['config']['train']['max_seq_len']} tokens."
+    max_len = record["config"]["train"]["max_seq_len"]
+    return (
+        f"Training examples truncated to {max_len} tokens: tuned {tuned:,}, control {control:,}."
+    )
 
 
 def _eval_truncation_line(record: dict) -> str | None:
@@ -97,12 +129,11 @@ def _eval_truncation_line(record: dict) -> str | None:
 def _sample_notes(record: dict) -> list[str]:
     d = record["dataset"]
     notes = []
+    total = _count(d["n_total"], "example")
     if d["n_scanned"] < d["n_total"]:
-        notes.append(f"Measured on a sample of {d['n_scanned']:,} of {d['n_total']:,} examples.")
+        notes.append(f"Measured on a sample of {d['n_scanned']:,} of {total}.")
     if "impact" in record["results"] and d["n_trained"] < d["n_total"]:
-        notes.append(
-            f"Impact measured by training on {d['n_trained']:,} of {d['n_total']:,} examples."
-        )
+        notes.append(f"Impact measured by training on {d['n_trained']:,} of {total}.")
     return notes
 
 
@@ -119,15 +150,14 @@ def _context_line(record: dict) -> str:
 
 
 def _side_effects_table(impact: dict) -> list[str]:
-    lines = [
-        "| Group | Data-specific (tuned − control) | Raw (tuned − base) |",
-        "|---|---|---|",
-    ]
+    header = (
+        "| Group | Data-specific (tuned − control) | Raw (tuned − base) "
+        "| Format effect (control − base) |"
+    )
+    lines = [header, "|---|---|---|---|"]
     for g in GROUPS:
-        lines.append(
-            f"| {g} | {fmt_delta(impact['delta_data_specific'][g])} "
-            f"| {fmt_delta(impact['delta_raw'][g])} |"
-        )
+        cells = (impact[key][g] for key in ("delta_data_specific", "delta_raw", "delta_control"))
+        lines.append(f"| {g} | " + " | ".join(fmt_delta(e) for e in cells) + " |")
     return lines
 
 
@@ -211,12 +241,24 @@ def _exposure_lines(exposure: dict) -> list[str]:
 
 
 def _baseline_lines(record: dict) -> list[str]:
+    """Paragraphs of the Baseline section. The chance notes go here only when there is no
+    per-benchmark table to put them under."""
     baseline = record["results"]["baseline"]
-    margin = (
-        f"Base model margin over chance on target benchmarks: {baseline['margin_pp']:+.1f} pp "
-        f"(need {baseline['required_pp']:.1f} pp)."
-    )
-    return [margin, *_chance_notes(record)]
+    out = [
+        (
+            f"Base model margin over chance on target benchmarks: {baseline['margin_pp']:+.1f} pp "
+            f"(need {baseline['required_pp']:.1f} pp)."
+        )
+    ]
+    chance = baseline.get("chance_pp")
+    if chance:
+        out.append(
+            "Chance is the larger of 1/k and the share of the most common answer among the "
+            "eval items: " + ", ".join(f"{b} {c:.1f}%" for b, c in chance.items()) + "."
+        )
+    if "impact" not in record["results"]:
+        out += _chance_notes(record)
+    return out
 
 
 def _chance_notes(record: dict) -> list[str]:
@@ -228,11 +270,13 @@ def _chance_notes(record: dict) -> list[str]:
     impact = record["results"].get("impact")
     if impact:
         targets &= set(impact["per_benchmark_accuracy"]["base"])
+    chance = baseline.get("chance_pp", {})
     for bench, margin in baseline.get("per_benchmark_pp", {}).items():
         if bench in targets and margin <= 0:
+            level = f" {chance[bench]:.1f}%" if bench in chance else ""
             lines.append(
                 f"Note: {bench} is at or below chance for the base model "
-                f"({margin:+.1f} pp vs. chance); gains there are unreliable."
+                f"({margin:+.1f} pp vs. chance{level}); gains there are unreliable."
             )
     return lines
 
@@ -260,6 +304,8 @@ def render_report(record: dict) -> str:
 
     if impact:
         out += [_headline(record), ""]
+        for line in _regression_lines(record):
+            out += [line, ""]
 
     for warning in _warnings(record):
         out += [warning, ""]
@@ -286,7 +332,9 @@ def render_report(record: dict) -> str:
             "",
         ]
     if "baseline" in results:
-        out += ["## Baseline", ""] + _baseline_lines(record) + [""]
+        out += ["## Baseline", ""]
+        for paragraph in _baseline_lines(record):
+            out += [paragraph, ""]
 
     if "impact" in results:  # the caveats are about the training runs
         out += ["## Caveats", ""] + [f"- {c}" for c in CAVEATS] + [""]
@@ -299,11 +347,12 @@ def render_summary(record: dict) -> str:
     headline = _headline(record)
     if headline:
         out.append(headline)
+        out.extend(_regression_lines(record))
         impact = record["results"]["impact"]
-        parts = [
-            f"{g}: {fmt_delta(impact['delta_data_specific'][g])}" for g in GROUPS if g != "target"
+        out.append("Side effects (data-specific, tuned − control):")
+        out += [
+            f"  {g}: {fmt_delta(impact['delta_data_specific'][g])}" for g in GROUPS if g != "target"
         ]
-        out.append("Side effects (data-specific): " + "; ".join(parts))
     stop = _stop_line(record)
     if stop:
         out.append(stop)

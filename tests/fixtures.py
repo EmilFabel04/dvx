@@ -128,6 +128,7 @@ def sample_record(**overrides) -> dict:
                 "ok": True,
                 "margin_pp": 12.0,
                 "per_benchmark_pp": {"medqa": 8.0, "medmcqa": 15.0, "pubmedqa": 13.0},
+                "chance_pp": {"medqa": 30.0, "medmcqa": 37.5, "pubmedqa": 55.2},
                 "required_pp": 5.0,
             },
             "impact": {

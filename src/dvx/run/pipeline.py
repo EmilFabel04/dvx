@@ -29,6 +29,7 @@ from dvx.contamination import find_contamination
 from dvx.data import Example, fingerprint, load_control_examples, load_examples, sample_examples
 from dvx.errors import DvxUserError
 from dvx.evals.registry import (
+    LETTERS,
     N_SHOTS,
     Group,
     Suite,
@@ -38,7 +39,13 @@ from dvx.evals.registry import (
     load_suite_shots,
 )
 from dvx.evals.scorer import PROTOCOL, score_mcq
-from dvx.evals.stats import BaselineCheck, baseline_check, group_accuracy, paired_delta
+from dvx.evals.stats import (
+    BaselineCheck,
+    baseline_check,
+    chance_level,
+    group_accuracy,
+    paired_delta,
+)
 from dvx.models import count_params, load_model, model_info, pick_device, release
 from dvx.record import (
     SCHEMA_VERSION,
@@ -509,7 +516,8 @@ def _min_k_scores(run: _Run, model, tok, texts: list[str]) -> list[float | None]
 
 
 def _evaluate(run: _Run, model, tok) -> dict:
-    """Per benchmark: item correctness and the number of left-truncated prompts."""
+    """Per benchmark: each item's predicted letter and correctness, and the number of
+    left-truncated prompts."""
     cfg = run.profile.scan
     scores = {
         b.name: score_mcq(
@@ -523,6 +531,7 @@ def _evaluate(run: _Run, model, tok) -> dict:
         for b in run.suite.benchmarks
     }
     return {
+        "predicted": {name: [LETTERS[p] for p in s.predicted] for name, s in scores.items()},
         "correct": {name: s.correct.tolist() for name, s in scores.items()},
         "n_truncated": {name: s.n_truncated for name, s in scores.items()},
     }
@@ -583,10 +592,12 @@ def _arrays(correct: dict[str, list[bool]], names: list[str]) -> dict[str, np.nd
 
 def _baseline(run: _Run, correct: dict[str, list[bool]]) -> BaselineCheck:
     names = [b.name for b in run.suite.by_group("target")]
-    n_options = {
-        n: Counter(len(item.options) for item in run.items[n]).most_common(1)[0][0] for n in names
-    }
-    return baseline_check(_arrays(correct, names), n_options, run.profile.baseline_margin)
+    chance = {}
+    for name in names:
+        items = run.items[name]
+        k = Counter(len(item.options) for item in items).most_common(1)[0][0]
+        chance[name] = chance_level([item.answer for item in items], k)
+    return baseline_check(_arrays(correct, names), chance, run.profile.baseline_margin)
 
 
 def _impact(run: _Run, base: dict, tuned: dict, control: dict) -> dict:
