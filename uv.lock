@@ -369,6 +369,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "datasketch" },
+    { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "peft" },
     { name = "torch" },
@@ -385,6 +386,7 @@ dev = [
 requires-dist = [
     { name = "datasets", specifier = ">=3.0" },
     { name = "datasketch", specifier = ">=1.6" },
+    { name = "huggingface-hub", specifier = ">=0.34" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "peft", specifier = ">=0.15" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },

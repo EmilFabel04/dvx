@@ -14,7 +14,7 @@ from dvx.evals.registry import MCQItem, get_suite
 from dvx.record import read_corpus
 from dvx.run import pipeline
 from dvx.run.pipeline import RunRequest, resume_run, run_scan, start_run
-from dvx.scan.calibration import CalibrationUnavailable
+from dvx.scan.calibration import CalibrationSet, CalibrationUnavailable, calibration_sha256
 
 GROUPS = {"target", "adjacent", "side_effect"}
 ITEMS = {
@@ -30,6 +30,13 @@ ITEMS = {
     ]
     for b in get_suite("medical-qa").benchmarks
 }
+SHOTS = {
+    name: [
+        MCQItem(name, f"{name}-shot-{i}", f"Solved example {i}?", ("one", "two", "three"), i % 3)
+        for i in range(5)
+    ]
+    for name in ITEMS
+}
 PROFILE = dataclasses.replace(
     PROFILES["quick"], train_cap=8, baseline_margin=-1.0, bootstrap_samples=50
 )
@@ -38,7 +45,7 @@ UNSEEN = [f"Article {i} reports a new event that happened in late {2025 + i}." f
 
 
 def fake_fetcher(unseen_after, n_per_side, cache_dir):
-    return SEEN, UNSEEN
+    return CalibrationSet(SEEN, UNSEEN, fetched_on="2026-10-30")
 
 
 def offline_fetcher(unseen_after, n_per_side, cache_dir):
@@ -87,6 +94,7 @@ def overrides(**kw):
     return {
         "profile_obj": PROFILE,
         "items": ITEMS,
+        "shots": SHOTS,
         "calibration_fetcher": fake_fetcher,
         "control_loader": fake_control,
         "device": "cpu",
@@ -137,7 +145,7 @@ def test_quick_end_to_end(tmp_path, monkeypatch):
     assert set(impact["delta_raw"]) == set(impact["delta_control"]) == GROUPS
     assert set(impact["accuracy"]) == {"base", "control", "tuned"}
     assert set(impact["per_benchmark_accuracy"]["tuned"]) == set(ITEMS)
-    assert rec.results["novelty"]["status"] == "ok"
+    assert rec.results["novelty"]["status"] == "inconclusive"  # reference == target
     assert rec.results["exposure"]["n_calibration"] == len(SEEN) + len(UNSEEN)
     assert rec.dataset["declared_date_range"] == ["2020-01-01", "2023-12-31"]
     assert rec.model["revision"] == TINY_REV and rec.model["unseen_after"] == "2024-01-01"
@@ -165,12 +173,173 @@ def test_quick_end_to_end(tmp_path, monkeypatch):
     assert not (out / "request.json.tmp").exists()
 
 
+def test_evaluation_protocol_and_shots_recorded(tmp_path):
+    req = make_request(tmp_path)
+    rec = start_run(req, **overrides())
+    ev = rec.evaluation
+    assert ev["protocol"] == "plain-text 5-shot log-likelihood letter scoring"
+    assert ev["max_len"] == PROFILE.scan.eval_max_len == 3072
+    for b in get_suite("medical-qa").benchmarks:
+        assert ev["shots"][b.name] == {
+            "split": b.shot_split or b.split,
+            "item_ids": [s.item_id for s in SHOTS[b.name]],
+        }
+    assert ev["n_truncated"] == {name: 0 for name in ITEMS}
+    steps = run_dir(req, rec) / "steps"
+    for step in ("eval_base", "tuned_s0", "control_s0"):
+        saved = json.loads((steps / f"{step}.json").read_text())
+        assert saved["n_truncated"] == ev["n_truncated"]
+
+
+def test_baseline_chance_is_max_of_uniform_and_majority(tmp_path):
+    rec = start_run(make_request(tmp_path), **overrides())
+    # ITEMS have answers A and B: majority 50% beats 1/k = 25%.
+    targets = ("medqa", "medmcqa", "pubmedqa")
+    assert rec.results["baseline"]["chance_pp"] == dict.fromkeys(targets, 50.0)
+
+
+def test_eval_steps_store_predicted_letters(tmp_path):
+    req = make_request(tmp_path)
+    rec = start_run(req, **overrides())
+    for step in ("eval_base", "tuned_s0", "control_s0"):
+        saved = json.loads((run_dir(req, rec) / "steps" / f"{step}.json").read_text())
+        for name, items in ITEMS.items():
+            letters = saved["predicted"][name]
+            assert len(letters) == len(items) and set(letters) <= set("ABCD")
+            assert saved["correct"][name] == [
+                "ABCD".index(p) == it.answer for p, it in zip(letters, items, strict=True)
+            ]
+
+
+def test_eval_prompts_carry_the_shots(tmp_path, monkeypatch):
+    calls = []
+    real = pipeline.score_mcq
+
+    def spy_score(model, tok, items, shots, **kwargs):
+        calls.append((items[0].benchmark, list(shots), kwargs["max_len"]))
+        return real(model, tok, items, shots, **kwargs)
+
+    monkeypatch.setattr(pipeline, "score_mcq", spy_score)
+    start_run(make_request(tmp_path), **overrides())
+    assert len(calls) == 3 * len(ITEMS)  # base, tuned, control
+    assert all(shots == SHOTS[name] and max_len == 3072 for name, shots, max_len in calls)
+
+
+def test_novelty_gate_and_reliability_recorded(tmp_path):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    novelty = rec.results["novelty"]
+    # The tiny model is its own reference: identical losses, so the reference is never
+    # below the target and the gate makes novelty inconclusive.
+    assert novelty["status"] == "inconclusive"
+    assert novelty["reason"].startswith("the reference loss is below the target loss on only 0.0%")
+    assert novelty["reference"] == {"id": TINY, "revision": TINY_REV}
+    rel = novelty["reliability"]
+    assert rel["reference_below_target"] == 0.0
+    assert (rel["min_reference_below_target"], rel["min_paired_discrimination"]) == (0.5, 0.6)
+    assert 0.0 <= rel["paired_discrimination"] <= 1.0
+    assert novelty["known_margin"] == 0.1 and novelty["noise_percentile"] == 10.0
+    assert isinstance(novelty["noise_threshold"], float)
+    assert novelty["loss_quartiles"]["target"] == novelty["loss_quartiles"]["reference"]
+    assert len(novelty["loss_quartiles"]["target"]) == 3
+    shown = [e for bucket in novelty["examples"].values() for e in bucket]
+    assert shown and all(len(e["response"]) <= 80 for e in shown)
+    assert all(len(b) <= 2 for b in novelty["examples"].values())
+    ref = json.loads((run_dir(req, rec) / "steps" / "scan_reference.json").read_text())
+    assert len(ref["mismatched_true_index"]) == len(ref["mismatched_losses"]) == 12
+
+
+def test_reproducibility_fields(tmp_path):
+    req = make_request(tmp_path)
+    rec = start_run(req, **overrides())
+    assert (rec.model["reference_id"], rec.model["reference_revision"]) == (TINY, TINY_REV)
+    assert rec.results["exposure"]["calibration_set"] == {
+        "source": "English Wikipedia article intros",
+        "sha256": calibration_sha256(SEEN, UNSEEN),
+        "fetched_on": "2026-10-30",
+        "n_seen": len(SEEN),
+        "n_unseen": len(UNSEEN),
+    }
+    env = rec.env
+    assert re.fullmatch(r"[0-9a-f]{40}", env["dvx_commit"]) and isinstance(env["dvx_dirty"], bool)
+    for key in ("machine", "processor", "device_name", "ram_bytes"):
+        assert env[key], key
+    request = json.loads((run_dir(req, rec) / "request.json").read_text())
+    assert request["engine"] == {"commit": env["dvx_commit"], "dirty": env["dvx_dirty"]}
+    assert rec.dataset["n_trained"] == 8
+
+
+def test_unregistered_reference_without_revision_records_the_loaded_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "_reference_revision", lambda req: None)
+    loads = spy(monkeypatch, "load_model")
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    assert [rev for _, rev, _ in loads] == [TINY_REV, None]  # target pinned; reference unpinned
+    assert rec.model["reference_revision"] == TINY_REV  # the HF cache snapshot it loaded
+    assert rec.results["novelty"]["reference"] == {"id": TINY, "revision": TINY_REV}
+    step = json.loads((run_dir(req, rec) / "steps" / "scan_reference.json").read_text())
+    assert step["commit"] == TINY_REV
+
+
+def test_no_calibration_set_without_calibration(tmp_path):
+    rec = run_scan(make_request(tmp_path), **overrides(calibration_fetcher=offline_fetcher))
+    assert rec.results["exposure"]["calibration_set"] is None
+
+
+def test_resume_warns_when_the_engine_source_changed(tmp_path, monkeypatch, capsys):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    (run_dir(req, rec) / "record.json").unlink()
+    started = json.loads((run_dir(req, rec) / "request.json").read_text())["engine"]
+    capsys.readouterr()
+    other = {"commit": "f" * 40, "dirty": True}
+    monkeypatch.setattr(pipeline, "engine_source", lambda: other)
+    resume_run(rec.run_id, req.home, **overrides())
+    err = capsys.readouterr().err
+    assert f"dvx: warning: run {rec.run_id} was started with dvx commit {started['commit']}" in err
+    assert f"now {'f' * 40} (dirty)" in err
+
+
+def test_resume_is_quiet_when_the_engine_source_matches(tmp_path, capsys):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    (run_dir(req, rec) / "record.json").unlink()
+    capsys.readouterr()
+    resume_run(rec.run_id, req.home, **overrides())
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_no_absolute_paths_in_record_corpus_or_report(tmp_path):
+    req = make_request(tmp_path)
+    rec = start_run(req, **overrides())
+    out = run_dir(req, rec)
+    home = str(tmp_path)
+    assert home not in json.dumps(dataclasses.asdict(rec))
+    assert home not in (req.home / "corpus.jsonl").read_text()
+    assert home not in (out / "report.md").read_text()
+    assert rec.dataset["name"] == "data.jsonl"
+    assert json.loads((out / "request.json").read_text())["request"]["data_path"].startswith(home)
+
+
+def test_steps_report_progress_on_stderr(tmp_path, capsys):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    err = capsys.readouterr().err.splitlines()
+    for step in ("dataset", "duplicates", "contamination", "scan_target", "scan_reference"):
+        assert f"dvx: step {step} started" in err
+        assert any(re.fullmatch(rf"dvx: step {step} finished in \d+\.\d s", line) for line in err)
+    (run_dir(req, rec) / "record.json").unlink()
+    resume_run(rec.run_id, req.home, **overrides())
+    assert "dvx: step scan_target cached" in capsys.readouterr().err.splitlines()
+
+
 def test_baseline_stop(tmp_path):
     req = make_request(tmp_path)
     rec = start_run(
         req, **overrides(profile_obj=dataclasses.replace(PROFILE, baseline_margin=0.99))
     )
     assert rec.status == "stopped_baseline"
+    assert rec.dataset["n_trained"] is None
     assert set(rec.results) == {"duplicates", "contamination", "novelty", "exposure", "baseline"}
     out = run_dir(req, rec)
     assert not (out / "steps" / "tuned_s0.json").exists()
@@ -206,7 +375,7 @@ def test_resume_finished_run_returns_record(tmp_path, monkeypatch):
     req = make_request(tmp_path)
     rec = run_scan(req, **overrides())
     saved = json.loads((run_dir(req, rec) / "record.json").read_text())
-    for name in ("load_examples", "load_model", "load_suite_items"):
+    for name in ("load_examples", "load_model", "load_suite_items", "load_suite_shots"):
         monkeypatch.setattr(pipeline, name, fail)
 
     resumed = resume_run(rec.run_id, req.home)
@@ -239,6 +408,23 @@ def test_resume_rejects_changed_dataset(tmp_path):
         resume_run(rec.run_id, req.home, **overrides())
 
 
+@pytest.mark.parametrize("saved_version", ["1", None])
+def test_resume_refuses_a_run_started_under_another_suite_version(tmp_path, saved_version):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    out = run_dir(req, rec)
+    (out / "record.json").unlink()
+    request = json.loads((out / "request.json").read_text())
+    assert request["suite_version"] == "2"
+    if saved_version is None:
+        del request["suite_version"]  # written before the field: suite v1
+    else:
+        request["suite_version"] = saved_version
+    (out / "request.json").write_text(json.dumps(request))
+    with pytest.raises(DvxUserError, match="suite v1; this dvx scores medical-qa with v2"):
+        resume_run(rec.run_id, req.home, **overrides())
+
+
 def test_resume_unknown_run(tmp_path):
     with pytest.raises(FileNotFoundError, match="nope"):
         resume_run("nope", tmp_path / "home")
@@ -265,7 +451,7 @@ def test_relative_data_path_resumes_from_elsewhere(tmp_path, monkeypatch):
     absolute = str((tmp_path / "data.jsonl").resolve())
     out = run_dir(req, rec)
     assert json.loads((out / "request.json").read_text())["request"]["data_path"] == absolute
-    assert rec.dataset["path"] == absolute
+    assert rec.dataset["name"] == "data.jsonl" and "path" not in rec.dataset
 
     (out / "record.json").unlink()
     elsewhere = tmp_path / "elsewhere"
@@ -292,12 +478,14 @@ def test_unknown_model_and_offline(tmp_path, monkeypatch):
     assert [rev for _, rev, _ in loads] == [None, commit, commit, commit]
 
 
-def test_scan_only(tmp_path):
+def test_scan_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "load_suite_shots", fail)  # a scan needs no shots
     req = make_request(tmp_path, unseen_after=None)
-    rec = run_scan(req, **overrides(calibration_fetcher=fail))
+    rec = run_scan(req, **overrides(calibration_fetcher=fail, shots=None))
     assert rec.status == "scan_only"
+    assert rec.evaluation is None
     assert set(rec.results) == {"duplicates", "contamination", "novelty", "exposure"}
-    assert rec.results["novelty"]["status"] == "ok"
+    assert rec.results["novelty"]["status"] == "inconclusive"
     exposure = rec.results["exposure"]
     assert exposure["status"] == "inconclusive"
     assert exposure["reason"] == "model release date unknown; pass --unseen-after"
@@ -308,12 +496,26 @@ def test_scan_only(tmp_path):
     assert len(read_corpus(req.home / "corpus.jsonl")) == 1
 
 
+def test_contamination_checks_the_whole_scan_sample(tmp_path, monkeypatch):
+    checked = []
+    real = pipeline.find_contamination
+
+    def spy_check(examples, items):
+        checked.append(len(examples))
+        return real(examples, items)
+
+    monkeypatch.setattr(pipeline, "find_contamination", spy_check)
+    profile = dataclasses.replace(PROFILE, measure_cap=10)  # train_cap 8
+    rec = run_scan(make_request(tmp_path), **overrides(profile_obj=profile))
+    assert checked == [rec.dataset["n_scanned"]] == [10]
+
+
 def test_sample_counts(tmp_path):
     req = make_request(tmp_path)
     rec = run_scan(req, **overrides(profile_obj=dataclasses.replace(PROFILE, measure_cap=10)))
     assert rec.dataset["n_total"] == 12
     assert rec.dataset["n_scanned"] == 10
-    assert rec.dataset["n_trained"] == 8
+    assert rec.dataset["n_trained"] is None  # a scan trains nothing
     assert rec.results["duplicates"]["n"] == 12
     assert sum(rec.results["novelty"]["counts"].values()) == 10
 

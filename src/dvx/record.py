@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from importlib.metadata import version
@@ -14,7 +16,8 @@ from typing import Literal
 import dvx
 from dvx.errors import DvxUserError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_PACKAGE_DIR = Path(dvx.__file__).resolve().parent
 
 
 @dataclass
@@ -34,13 +37,74 @@ class RunRecord:
     config: dict
     results: dict
     compute: dict
+    evaluation: dict | None = None  # added in schema 2; None for a scan
 
 
 def new_run_id(now: datetime, fingerprint: str) -> str:
     return f"{now:%Y%m%d-%H%M%S}-{fingerprint[:8]}"
 
 
+def _git(*args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(_PACKAGE_DIR), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout.strip()
+
+
+def engine_source() -> dict:
+    """The git commit of the dvx source tree and whether it has uncommitted changes.
+
+    Both None when dvx does not run from a git checkout of itself (for example, an
+    installed wheel, possibly inside some other repository) or git is unavailable.
+    """
+    try:
+        top = Path(_git("rev-parse", "--show-toplevel"))
+        if (top / "src" / "dvx").resolve() != _PACKAGE_DIR:
+            return {"commit": None, "dirty": None}
+        return {"commit": _git("rev-parse", "HEAD"), "dirty": bool(_git("status", "--porcelain"))}
+    except (OSError, subprocess.SubprocessError):
+        return {"commit": None, "dirty": None}
+
+
+def _chip() -> str | None:
+    """The CPU or SoC name, e.g. "Apple M5"; None if it can't be read."""
+    try:
+        if sys.platform == "darwin":
+            cmd = ["sysctl", "-n", "machdep.cpu.brand_string"]
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+            return out.stdout.strip() or None
+        if sys.platform.startswith("linux"):
+            for line in Path("/proc/cpuinfo").read_text().splitlines():
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return platform.processor() or None
+
+
+def _ram_bytes() -> int | None:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _device_name(device: str, chip: str | None) -> str | None:
+    """The CUDA device name; for MPS and CPU, the chip (torch names no MPS device)."""
+    if device == "cuda":
+        import torch
+
+        return torch.cuda.get_device_name(0)
+    return chip
+
+
 def env_info(device: str) -> dict:
+    """Library versions, the dvx source commit, and the hardware the run used."""
+    source = engine_source()
+    chip = _chip()
     return {
         "python": platform.python_version(),
         "platform": platform.platform(),
@@ -50,6 +114,12 @@ def env_info(device: str) -> dict:
         "datasets": version("datasets"),
         "device": device,
         "dvx": dvx.__version__,
+        "dvx_commit": source["commit"],
+        "dvx_dirty": source["dirty"],
+        "machine": platform.machine(),
+        "processor": chip,
+        "device_name": _device_name(device, chip),
+        "ram_bytes": _ram_bytes(),
     }
 
 

@@ -4,7 +4,13 @@ import json
 import numpy as np
 import pytest
 
-from dvx.evals.stats import Estimate, baseline_check, group_accuracy, paired_delta
+from dvx.evals.stats import (
+    Estimate,
+    baseline_check,
+    chance_level,
+    group_accuracy,
+    paired_delta,
+)
 
 
 def test_group_accuracy():
@@ -44,7 +50,7 @@ def test_paired_delta_validates():
 def test_json_safe():
     a = {"x": np.array([1, 0, 1, 1], bool)}
     e = group_accuracy(a, 50, 0)
-    c = baseline_check(a, {"x": 4}, 0.05)
+    c = baseline_check(a, {"x": 0.25}, 0.05)
     json.dumps(dataclasses.asdict(e))
     json.dumps(dataclasses.asdict(c))
     assert type(e.value) is float and type(c.ok) is bool
@@ -52,12 +58,35 @@ def test_json_safe():
 
 def test_baseline():
     correct = {"a": np.array([1] * 3 + [0] * 7, bool), "b": np.array([1] * 4 + [0] * 6, bool)}
-    k = {"a": 4, "b": 3}
-    ok = baseline_check(correct, k, 0.05)
+    chance = {"a": 0.25, "b": 1 / 3}
+    ok = baseline_check(correct, chance, 0.05)
     assert ok.ok and ok.margin_pp == pytest.approx(5.8333, abs=1e-3)
     assert ok.required_pp == pytest.approx(5.0)
     assert ok.per_benchmark_pp["a"] == pytest.approx(5.0)
-    assert not baseline_check(correct, k, 0.10).ok
+    assert ok.chance_pp == pytest.approx({"a": 25.0, "b": 100 / 3})
+    assert not baseline_check(correct, chance, 0.10).ok
+
+
+def test_chance_level_is_the_larger_of_uniform_and_majority():
+    assert chance_level([0, 1, 2, 3], 4) == 0.25
+    assert chance_level([0, 0, 0, 1], 4) == 0.75
+    assert chance_level([0, 1, 1], 3) == pytest.approx(2 / 3)
+    assert chance_level([0, 1, 2, 2], 3) == 0.5
+
+
+def test_always_a_on_skewed_answers_fails_the_gate():
+    # 45% of answers are A: a model that always answers A has no skill, yet beat 1/k by 20 pp.
+    answers = [0] * 45 + [1] * 20 + [2] * 20 + [3] * 15
+    always_a = {"medqa": np.array([a == 0 for a in answers])}
+    check = baseline_check(always_a, {"medqa": chance_level(answers, 4)}, 0.05)
+    assert not check.ok and check.per_benchmark_pp["medqa"] == pytest.approx(0.0)
+
+
+def test_just_above_uniform_but_below_majority_is_below_chance():
+    answers = [0] * 30 + [1] * 25 + [2] * 25 + [3] * 20  # majority 30% > 1/k 25%
+    correct = {"medqa": np.array([True] * 27 + [False] * 73)}
+    check = baseline_check(correct, {"medqa": chance_level(answers, 4)}, 0.05)
+    assert check.per_benchmark_pp["medqa"] == pytest.approx(-3.0)
 
 
 def test_includes_zero():

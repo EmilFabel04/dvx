@@ -1,8 +1,18 @@
 from dataclasses import replace
 
 import pytest
+from fixtures import benchmark_rows
 
-from dvx.evals.registry import MCQItem, UnknownDomain, get_suite, load_items
+from dvx.evals.registry import (
+    N_SHOTS,
+    MCQItem,
+    UnknownDomain,
+    get_suite,
+    load_items,
+    load_shots,
+    load_suite_items,
+    load_suite_shots,
+)
 
 
 def _bench(name):
@@ -11,7 +21,7 @@ def _bench(name):
 
 def test_medical_suite():
     s = get_suite("medical-qa")
-    assert s.version == "1"
+    assert s.version == "2"
     assert [b.name for b in s.by_group("target")] == ["medqa", "medmcqa", "pubmedqa"]
     assert next(b.name for b in s.by_group("side_effect")) == "arc_challenge"
     assert len(s.by_group("adjacent")) == 4 and len(s.by_group("side_effect")) == 5
@@ -191,6 +201,84 @@ def test_pinned_benchmark_values():
     assert {b.name for b in benchmarks} == set(_PINS)
     for b in benchmarks:
         assert (b.group, b.hf_id, b.config, b.split, b.revision, b.size) == _PINS[b.name], b.name
+
+
+# Few-shot rows come from another split of the same pinned dataset where one exists;
+# PubMedQA pqa_labeled has only "train", so its shots are rows not sampled as eval items.
+_SHOT_SPLITS = {
+    "medqa": "train",
+    "medmcqa": "train",
+    "pubmedqa": None,
+    "arc_challenge": "train",
+    **{name: "dev" for name in _PINS if name.startswith("mmlu_")},
+}
+
+
+def test_shot_splits():
+    assert N_SHOTS == 5
+    assert {b.name: b.shot_split for b in get_suite("medical-qa").benchmarks} == _SHOT_SPLITS
+
+
+def _eval_and_shot_rows(bench, shot_overrides=None):
+    """Hub-format rows for one benchmark: (eval split rows, rows its shots are drawn from)."""
+    eval_rows = benchmark_rows(bench.name, bench.split, 30)
+    if bench.shot_split is None:
+        return eval_rows, eval_rows
+    return eval_rows, benchmark_rows(bench.name, bench.shot_split, 12, shot_overrides)
+
+
+@pytest.mark.parametrize("bench", get_suite("medical-qa").benchmarks, ids=lambda b: b.name)
+def test_shots_are_disjoint_from_eval_items(bench):
+    eval_rows, shot_rows = _eval_and_shot_rows(bench)
+    items = load_items(replace(bench, size=10), rows=eval_rows)
+    shots = load_shots(bench, items, rows=shot_rows)
+    assert len(shots) == N_SHOTS
+    assert all(s.benchmark == bench.name for s in shots)
+    assert {s.question for s in shots}.isdisjoint(it.question for it in items)
+    if bench.shot_split is None:  # same split: the shots must be rows left out of the sample
+        assert {s.item_id for s in shots}.isdisjoint(it.item_id for it in items)
+
+
+@pytest.mark.parametrize("bench", get_suite("medical-qa").benchmarks, ids=lambda b: b.name)
+def test_shots_are_deterministic_and_seeded(bench):
+    eval_rows, shot_rows = _eval_and_shot_rows(bench)
+    items = load_items(replace(bench, size=10), rows=eval_rows)
+    first = load_shots(bench, items, rows=shot_rows)
+    assert first == load_shots(bench, items, rows=shot_rows)
+    assert first == load_shots(bench, items, rows=shot_rows, seed=0)
+    others = {tuple(load_shots(bench, items, rows=shot_rows, seed=s)) for s in range(1, 6)}
+    assert others - {tuple(first)}
+
+
+def test_shots_skip_rows_that_repeat_an_eval_question():
+    bench = _bench("medmcqa")
+    eval_rows = benchmark_rows("medmcqa", "validation", 30)
+    items = load_items(replace(bench, size=10), rows=eval_rows)
+    repeats = {i: items[i % len(items)].question.upper() + "  " for i in range(7)}
+    shot_rows = benchmark_rows("medmcqa", "train", 12, repeats)  # rows 0-6 restate eval items
+    shots = load_shots(bench, items, rows=shot_rows)
+    assert sorted(s.item_id for s in shots) == [f"train-{i:04d}" for i in range(7, 12)]
+
+
+def test_too_few_shot_rows_raises():
+    bench = _bench("arc_challenge")
+    items = load_items(bench, rows=benchmark_rows("arc_challenge", "test", 3))
+    with pytest.raises(ValueError, match="5 shots"):
+        load_shots(bench, items, rows=benchmark_rows("arc_challenge", "train", 4))
+
+
+@pytest.mark.slow
+def test_hub_shots_are_disjoint_and_pinned_by_seed():
+    suite = get_suite("medical-qa")
+    items = load_suite_items(suite)
+    shots = load_suite_shots(suite, items)
+    for b in suite.benchmarks:
+        assert len(shots[b.name]) == N_SHOTS, b.name
+        assert {s.question for s in shots[b.name]}.isdisjoint(i.question for i in items[b.name])
+        if b.shot_split is None:
+            ids = {s.item_id for s in shots[b.name]}
+            assert ids.isdisjoint(i.item_id for i in items[b.name]), b.name
+    assert shots == load_suite_shots(suite, items)
 
 
 @pytest.mark.slow

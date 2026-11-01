@@ -1,5 +1,7 @@
 """Bootstrap confidence intervals, paired deltas and the baseline check (pure numpy)."""
 
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -21,6 +23,7 @@ class BaselineCheck:
     margin_pp: float
     per_benchmark_pp: dict[str, float]
     required_pp: float
+    chance_pp: dict[str, float]
 
 
 def _bootstrap(per_item: dict[str, np.ndarray], n_boot: int, seed: int) -> Estimate:
@@ -55,11 +58,18 @@ def paired_delta(
     return _bootstrap(diffs, n_boot, seed)
 
 
+def chance_level(answers: Sequence[int], n_options: int) -> float:
+    """What a no-skill model scores: max(1/k, the share of the most common answer)."""
+    majority = Counter(answers).most_common(1)[0][1] / len(answers)
+    return max(1.0 / n_options, majority)
+
+
 def baseline_check(
-    correct: dict[str, np.ndarray], n_options: dict[str, int], min_margin: float
+    correct: dict[str, np.ndarray], chance: dict[str, float], min_margin: float
 ) -> BaselineCheck:
-    """Mean over benchmarks of (accuracy - 1/k), in pp; ok if it reaches min_margin."""
-    per = {k: float((np.mean(v) - 1.0 / n_options[k]) * 100.0) for k, v in correct.items()}
+    """Mean over benchmarks of (accuracy - chance), in pp; ok if it reaches min_margin."""
+    per = {k: float((np.mean(v) - chance[k]) * 100.0) for k, v in correct.items()}
     margin = float(np.mean(list(per.values())))
     required = float(min_margin * 100.0)
-    return BaselineCheck(bool(margin >= required), margin, per, required)
+    chance_pp = {k: float(chance[k] * 100.0) for k in correct}
+    return BaselineCheck(bool(margin >= required), margin, per, required, chance_pp)

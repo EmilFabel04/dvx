@@ -1,11 +1,14 @@
-"""Prompt rendering and supervised fine-tuning encoding."""
+"""Prompt rendering and supervised fine-tuning encoding.
+
+One plain-text protocol for every model; chat templates are never applied.
+"""
 
 from dataclasses import dataclass
 
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from dvx.data import Example
-from dvx.evals.registry import MCQItem
+from dvx.evals.registry import LETTERS, MCQItem
 
 IGNORE = -100
 MIN_MAX_LEN = 8
@@ -19,22 +22,10 @@ class EncodedExample:
     truncated: bool
 
 
-def _apply_chat(tokenizer: PreTrainedTokenizerBase, msgs: list[dict[str, str]]) -> str:
-    return tokenizer.apply_chat_template(
-        msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
-    )
-
-
-def render_prompt(
-    tokenizer: PreTrainedTokenizerBase, prompt: str, system: str | None = None
-) -> str:
-    if tokenizer.chat_template:
-        msgs = ([{"role": "system", "content": system}] if system else []) + [
-            {"role": "user", "content": prompt}
-        ]
-        return _apply_chat(tokenizer, msgs)
-    prefix = f"{system}\n\n" if system else ""
-    return f"{prefix}### Question:\n{prompt}\n\n### Answer:\n"
+def render_prompt(prompt: str, system: str | None = None) -> str:
+    """SFT prompt text: the system text (if any) and the prompt joined by a blank line,
+    then the blank line that separates the prompt from the response."""
+    return "\n\n".join([system, prompt] if system else [prompt]) + "\n\n"
 
 
 def _adds_bos(tokenizer: PreTrainedTokenizerBase, text: str) -> bool:
@@ -48,21 +39,24 @@ def _adds_bos(tokenizer: PreTrainedTokenizerBase, text: str) -> bool:
 
 
 def encode_prompt_text(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
-    """Token ids for rendered prompt text, exactly as SFT encodes a prompt."""
+    """Token ids for rendered prompt text, exactly as SFT encodes a prompt: BOS first
+    if the tokenizer would add one itself."""
     ids = tokenizer(text, add_special_tokens=False).input_ids
-    # Chat templates already emit their own special tokens; on the plain path
-    # add BOS only if the tokenizer would add it itself.
-    if not tokenizer.chat_template and _adds_bos(tokenizer, text):
+    if _adds_bos(tokenizer, text):
         ids = [tokenizer.bos_token_id, *ids]
     return ids
 
 
-def render_mcq(tokenizer: PreTrainedTokenizerBase, item: MCQItem) -> str:
-    options = "\n".join(f"{chr(ord('A') + i)}. {opt}" for i, opt in enumerate(item.options))
-    content = f"{item.question}\n\n{options}\n\nAnswer with the letter of the correct option."
-    if tokenizer.chat_template:
-        return _apply_chat(tokenizer, [{"role": "user", "content": content}])
-    return f"{content}\nAnswer:"
+def _mcq_block(item: MCQItem) -> str:
+    options = "".join(f"{LETTERS[i]}. {opt}\n" for i, opt in enumerate(item.options))
+    return f"Question: {item.question}\n{options}Answer:"
+
+
+def render_mcq(item: MCQItem, shots: tuple[MCQItem, ...] | list[MCQItem] = ()) -> str:
+    """Plain-text few-shot prompt, lm-eval style: each shot's block followed by its answer
+    letter and a blank line, then the item's block ending in "Answer:"."""
+    solved = "".join(f"{_mcq_block(s)} {LETTERS[s.answer]}\n\n" for s in shots)
+    return solved + _mcq_block(item)
 
 
 def padded_width(longest: int, max_len: int) -> int:
@@ -79,7 +73,7 @@ def padded_width(longest: int, max_len: int) -> int:
 def encode_sft(tokenizer: PreTrainedTokenizerBase, ex: Example, max_len: int) -> EncodedExample:
     if max_len < MIN_MAX_LEN:
         raise ValueError(f"max_len must be at least {MIN_MAX_LEN}, got {max_len}")
-    prompt = encode_prompt_text(tokenizer, render_prompt(tokenizer, ex.prompt, ex.system))
+    prompt = encode_prompt_text(tokenizer, render_prompt(ex.prompt, ex.system))
     response = [
         *tokenizer(ex.response, add_special_tokens=False).input_ids,
         tokenizer.eos_token_id,

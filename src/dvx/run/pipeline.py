@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -28,14 +29,30 @@ from dvx.config import PROFILES, Profile, ScanConfig, TrainConfig
 from dvx.contamination import find_contamination
 from dvx.data import Example, fingerprint, load_control_examples, load_examples, sample_examples
 from dvx.errors import DvxUserError
-from dvx.evals.registry import Group, Suite, SuiteItems, get_suite, load_suite_items
-from dvx.evals.scorer import score_mcq
-from dvx.evals.stats import BaselineCheck, baseline_check, group_accuracy, paired_delta
+from dvx.evals.registry import (
+    LETTERS,
+    N_SHOTS,
+    Group,
+    Suite,
+    SuiteItems,
+    get_suite,
+    load_suite_items,
+    load_suite_shots,
+)
+from dvx.evals.scorer import PROTOCOL, score_mcq
+from dvx.evals.stats import (
+    BaselineCheck,
+    baseline_check,
+    chance_level,
+    group_accuracy,
+    paired_delta,
+)
 from dvx.models import count_params, load_model, model_info, pick_device, release
 from dvx.record import (
     SCHEMA_VERSION,
     RunRecord,
     append_to_corpus,
+    engine_source,
     env_info,
     new_run_id,
     read_corpus,
@@ -43,11 +60,23 @@ from dvx.record import (
 )
 from dvx.report import render_report
 from dvx.run.steps import cached_step, write_json_atomic
-from dvx.scan.calibration import CalibrationUnavailable, fetch_calibration_texts
+from dvx.scan.calibration import (
+    CALIBRATION_SOURCE,
+    CalibrationSet,
+    CalibrationUnavailable,
+    calibration_sha256,
+    fetch_calibration_texts,
+)
 from dvx.scan.duplicates import duplicate_stats
 from dvx.scan.exposure import assess_exposure, exposure_inconclusive, min_k_score
 from dvx.scan.losses import response_losses, token_logprobs
-from dvx.scan.novelty import classify, mismatched_pairs, novelty_unavailable
+from dvx.scan.novelty import (
+    NoveltyResult,
+    bucket_examples,
+    classify,
+    mismatched_pairs,
+    novelty_unavailable,
+)
 from dvx.train import finetune_lora
 
 GROUPS: tuple[Group, ...] = get_args(Group)
@@ -57,7 +86,7 @@ NO_REFERENCE = "no reference model"
 TOO_FEW_EXAMPLES = "need at least 2 examples"
 _SNAPSHOT = re.compile(r"snapshots/([0-9a-f]{40})/")
 
-CalibrationFetcher = Callable[[date, int, Path], tuple[list[str], list[str]]]
+CalibrationFetcher = Callable[[date, int, Path], CalibrationSet]
 ControlLoader = Callable[[int, int], list[Example]]
 
 
@@ -88,10 +117,12 @@ class _Run:
     profile: Profile
     suite: Suite
     items: SuiteItems
+    shots: SuiteItems  # few-shot examples per benchmark; empty for a scan
     device: str
     calibration_fetcher: CalibrationFetcher
     control_loader: ControlLoader
     outputs: dict[str, dict] = field(default_factory=dict)
+    reference_revision: str | None = None  # resolved when the reference step runs
 
     @property
     def dir(self) -> Path:
@@ -111,6 +142,7 @@ def start_run(
     *,
     profile_obj: Profile | None = None,
     items: SuiteItems | None = None,
+    shots: SuiteItems | None = None,
     calibration_fetcher: CalibrationFetcher = fetch_calibration_texts,
     control_loader: ControlLoader = load_control_examples,
     device: str | None = None,
@@ -123,6 +155,7 @@ def start_run(
         now=now,
         profile_obj=profile_obj,
         items=items,
+        shots=shots,
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
         device=device,
@@ -134,6 +167,7 @@ def run_scan(
     *,
     profile_obj: Profile | None = None,
     items: SuiteItems | None = None,
+    shots: SuiteItems | None = None,
     calibration_fetcher: CalibrationFetcher = fetch_calibration_texts,
     control_loader: ControlLoader = load_control_examples,
     device: str | None = None,
@@ -146,6 +180,7 @@ def run_scan(
         now=now,
         profile_obj=profile_obj,
         items=items,
+        shots=shots,
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
         device=device,
@@ -158,6 +193,7 @@ def resume_run(
     *,
     profile_obj: Profile | None = None,
     items: SuiteItems | None = None,
+    shots: SuiteItems | None = None,
     calibration_fetcher: CalibrationFetcher = fetch_calibration_texts,
     control_loader: ControlLoader = load_control_examples,
     device: str | None = None,
@@ -172,6 +208,14 @@ def resume_run(
     if record_path.exists():
         return RunRecord(**json.loads(record_path.read_text(encoding="utf-8")))
     saved = json.loads(request_path.read_text(encoding="utf-8"))
+    domain = saved["request"]["domain"]
+    started_with, current = saved.get("suite_version", "1"), get_suite(domain).version
+    if started_with != current:
+        raise DvxUserError(
+            f"run {run_id} was started with suite v{started_with}; this dvx scores {domain} "
+            f"with v{current}, so its cached eval steps are not comparable. Start a new run."
+        )
+    _warn_if_engine_changed(run_id, saved.get("engine", {"commit": None, "dirty": None}))
     profile = _profile_from_json(saved["profile"])
     if profile_obj is not None and profile_obj != profile:
         raise DvxUserError(
@@ -188,6 +232,7 @@ def resume_run(
         examples,
         profile_obj=profile,
         items=items,
+        shots=shots,
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
         device=device,
@@ -206,9 +251,26 @@ def _new_run(req: RunRequest, *, scan_only: bool, now: datetime | None, **resolv
         "scan_only": scan_only,
         "profile": asdict(run.profile),
         "request": _request_to_json(run.req),
+        "suite_version": run.suite.version,  # resume refuses another version's cached evals
+        "engine": engine_source(),
     }
     write_json_atomic(run.dir / "request.json", request, indent=2)
     return _execute(run)
+
+
+def _describe(source: dict) -> str:
+    commit = source.get("commit") or "unknown"
+    return commit + (" (dirty)" if source.get("dirty") else "")
+
+
+def _warn_if_engine_changed(run_id: str, started: dict) -> None:
+    now = engine_source()
+    if started != now:
+        print(
+            f"dvx: warning: run {run_id} was started with dvx commit {_describe(started)}, "
+            f"now {_describe(now)}; its cached steps came from the earlier code.",
+            file=sys.stderr,
+        )
 
 
 def _prepare(
@@ -220,6 +282,7 @@ def _prepare(
     *,
     profile_obj: Profile | None,
     items: SuiteItems | None,
+    shots: SuiteItems | None,
     calibration_fetcher: CalibrationFetcher,
     control_loader: ControlLoader,
     device: str | None,
@@ -230,6 +293,10 @@ def _prepare(
             f"the pipeline trains exactly one seed; profile {profile.name!r} has {profile.seeds}"
         )
     suite = get_suite(req.domain)
+    if items is None:
+        items = load_suite_items(suite)
+    if shots is None:
+        shots = {} if scan_only else load_suite_shots(suite, items)
     return _Run(
         req=req,
         run_id=run_id,
@@ -239,7 +306,8 @@ def _prepare(
         fingerprint=fingerprint(examples),
         profile=profile,
         suite=suite,
-        items=items if items is not None else load_suite_items(suite),
+        items=items,
+        shots=shots,
         device=device or pick_device(),
         calibration_fetcher=calibration_fetcher,
         control_loader=control_loader,
@@ -260,6 +328,10 @@ def _resolve_request(req: RunRequest) -> RunRequest:
 
 
 def _reference_revision(req: RunRequest) -> str | None:
+    """The reference's pinned revision: the target's if they are the same model, else the
+    registry's; None if neither pins one (the reference step then records the commit)."""
+    if req.reference_id is None:
+        return None
     if req.reference_id == req.model_id:
         return req.revision
     return model_info(req.reference_id).revision
@@ -320,26 +392,21 @@ def _execute(run: _Run) -> RunRecord:
     results = {
         "duplicates": _public(run.step("duplicates", lambda: _duplicates_step(run))),
         "contamination": _public(
-            run.step("contamination", lambda: _contamination_step(run, train))
+            run.step("contamination", lambda: _contamination_step(run, scan))
         ),
     }
     target = run.step("scan_target", lambda: _scan_target_step(run, scan))
     if run.req.revision is None:  # pin later loads and the record to the commit just loaded
         run.req = replace(run.req, revision=target["commit"])
+    run.reference_revision = _reference_revision(run.req)
     skip = _reference_skip(run.req, scan)
     if skip:
         novelty = novelty_unavailable(skip, len(scan))
     else:
         ref = run.step("scan_reference", lambda: _scan_reference_step(run, scan))
-        cfg = run.profile.scan
-        novelty = classify(
-            target["losses"],
-            ref["losses"],
-            ref["mismatched_losses"],
-            cfg.known_margin,
-            cfg.noise_percentile,
-        )
-    results["novelty"] = novelty.summary()
+        run.reference_revision = run.reference_revision or ref["commit"]
+        novelty = _novelty(run, target, ref)
+    results["novelty"] = _novelty_summary(run, novelty, scan)
     results["exposure"] = _exposure(run, target)
     if run.scan_only:
         return _finish(run, "scan_only", results, ds, target)
@@ -391,13 +458,15 @@ def _duplicates_step(run: _Run) -> dict:
     return asdict(stats)
 
 
-def _contamination_step(run: _Run, train: list[Example]) -> dict:
+def _contamination_step(run: _Run, scan: list[Example]) -> dict:
+    """Checks the whole scan sample (up to measure_cap), which contains the train sample."""
     items = [item for b in run.suite.benchmarks for item in run.items[b.name]]
-    return asdict(find_contamination(train, items))
+    return asdict(find_contamination(scan, items))
 
 
 def _scan_target_step(run: _Run, scan: list[Example]) -> dict:
-    seen, unseen, reason = _calibration_texts(run)
+    cal, reason = _calibration_texts(run)
+    seen, unseen = (cal.seen, cal.unseen) if cal else ([], [])
     texts = [e.prompt + "\n" + e.response for e in scan]
     with _loaded(run.req.model_id, run.req.revision, run.device) as (model, tok):
         return {
@@ -409,29 +478,46 @@ def _scan_target_step(run: _Run, scan: list[Example]) -> dict:
                 "reason": reason,
                 "seen": _min_k_scores(run, model, tok, seen),
                 "unseen": _min_k_scores(run, model, tok, unseen),
+                "set": _calibration_set(cal),
             },
         }
 
 
+def _calibration_set(cal: CalibrationSet | None) -> dict | None:
+    """What the calibration texts were: their hash, fetch date and counts."""
+    if cal is None:
+        return None
+    return {
+        "source": CALIBRATION_SOURCE,
+        "sha256": calibration_sha256(cal.seen, cal.unseen),
+        "fetched_on": cal.fetched_on,
+        "n_seen": len(cal.seen),
+        "n_unseen": len(cal.unseen),
+    }
+
+
 def _scan_reference_step(run: _Run, scan: list[Example]) -> dict:
-    mismatched = mismatched_pairs(scan, run.profile.scan.mismatched_n, seed=SEED)
-    with _loaded(run.req.reference_id, _reference_revision(run.req), run.device) as (model, tok):
+    mismatched, true_index = mismatched_pairs(scan, run.profile.scan.mismatched_n, seed=SEED)
+    ref_id, revision = run.req.reference_id, _reference_revision(run.req)
+    with _loaded(ref_id, revision, run.device) as (model, tok):
         return {
+            "commit": _loaded_commit(ref_id, revision),
             "losses": _losses(run, model, tok, scan),
             "mismatched_losses": _losses(run, model, tok, mismatched),
+            "mismatched_true_index": true_index,  # scan index of each pair's true pair
         }
 
 
 def _eval_base_step(run: _Run) -> dict:
     with _loaded(run.req.model_id, run.req.revision, run.device) as (model, tok):
-        return {"correct": _evaluate(run, model, tok)}
+        return _evaluate(run, model, tok)
 
 
 def _finetune_step(run: _Run, examples: list[Example]) -> dict:
     # A fresh target every time: peft wraps the model in place.
     with _loaded(run.req.model_id, run.req.revision, run.device) as (model, tok):
         tuned, stats = finetune_lora(model, tok, examples, run.profile.train, seed=run.seed)
-        return {"train": asdict(stats), "correct": _evaluate(run, tuned, tok)}
+        return {"train": asdict(stats), **_evaluate(run, tuned, tok)}
 
 
 def _loaded_commit(model_id: str, revision: str | None) -> str | None:
@@ -449,28 +535,30 @@ def _loaded_commit(model_id: str, revision: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-def _calibration_texts(run: _Run) -> tuple[list[str], list[str], str | None]:
-    """(seen, unseen, reason); the reason says why there are no calibration texts."""
+def _calibration_texts(run: _Run) -> tuple[CalibrationSet | None, str | None]:
+    """(texts, reason); the reason says why there are no calibration texts."""
     if run.req.unseen_after is None:
-        return [], [], NO_RELEASE_DATE
+        return None, NO_RELEASE_DATE
     cfg = run.profile.scan
     try:
-        seen, unseen = run.calibration_fetcher(
+        cal = run.calibration_fetcher(
             run.req.unseen_after, cfg.calibration_per_side, run.req.home / "calibration"
         )
     except CalibrationUnavailable as err:
-        return [], [], f"calibration unavailable: {err}"
-    return seen, unseen, None
+        return None, f"calibration unavailable: {err}"
+    return cal, None
 
 
-def _losses(run: _Run, model, tok, examples: list[Example]) -> list[float]:
-    return response_losses(
+def _losses(run: _Run, model, tok, examples: list[Example]) -> list[float | None]:
+    """Response losses; a non-finite one is stored as JSON null (classify excludes it)."""
+    losses = response_losses(
         model,
         tok,
         examples,
         max_len=run.profile.train.max_seq_len,
         batch_size=run.profile.scan.batch_size,
     )
+    return [v if np.isfinite(v) else None for v in losses]
 
 
 def _min_k_scores(run: _Run, model, tok, texts: list[str]) -> list[float | None]:
@@ -484,13 +572,25 @@ def _min_k_scores(run: _Run, model, tok, texts: list[str]) -> list[float | None]
     return [None if np.isnan(s) else s for s in scores]
 
 
-def _evaluate(run: _Run, model, tok) -> dict[str, list[bool]]:
+def _evaluate(run: _Run, model, tok) -> dict:
+    """Per benchmark: each item's predicted letter and correctness, and the number of
+    left-truncated prompts."""
     cfg = run.profile.scan
-    return {
+    scores = {
         b.name: score_mcq(
-            model, tok, run.items[b.name], batch_size=cfg.batch_size, max_len=cfg.score_max_len
-        ).tolist()
+            model,
+            tok,
+            run.items[b.name],
+            run.shots[b.name],
+            batch_size=cfg.batch_size,
+            max_len=cfg.eval_max_len,
+        )
         for b in run.suite.benchmarks
+    }
+    return {
+        "predicted": {name: [LETTERS[p] for p in s.predicted] for name, s in scores.items()},
+        "correct": {name: s.correct.tolist() for name, s in scores.items()},
+        "n_truncated": {name: s.n_truncated for name, s in scores.items()},
     }
 
 
@@ -509,14 +609,39 @@ def _reference_skip(req: RunRequest, scan: list[Example]) -> str | None:
     return None
 
 
+def _novelty(run: _Run, target: dict, ref: dict) -> NoveltyResult:
+    cfg = run.profile.scan
+    return classify(
+        target["losses"],
+        ref["losses"],
+        ref["mismatched_losses"],
+        [ref["losses"][j] for j in ref["mismatched_true_index"]],
+        cfg.known_margin,
+        cfg.noise_percentile,
+        cfg.novelty_min_reference_below_target,
+        cfg.novelty_min_paired_discrimination,
+    )
+
+
+def _novelty_summary(run: _Run, novelty: NoveltyResult, scan: list[Example]) -> dict:
+    """The novelty record: the result, the reference that produced it, example items."""
+    ref = run.req.reference_id
+    return {
+        **novelty.summary(),
+        "reference": None if ref is None else {"id": ref, "revision": run.reference_revision},
+        "examples": bucket_examples(novelty.labels, scan),
+    }
+
+
 def _exposure(run: _Run, target: dict) -> dict:
     cal = target["calibration"]
     if cal["reason"]:
-        return asdict(exposure_inconclusive(cal["reason"]))
-    result = assess_exposure(
-        target["scores"], cal["seen"], cal["unseen"], min_auc=run.profile.scan.exposure_min_auc
-    )
-    return asdict(result)
+        result = exposure_inconclusive(cal["reason"])
+    else:
+        result = assess_exposure(
+            target["scores"], cal["seen"], cal["unseen"], min_auc=run.profile.scan.exposure_min_auc
+        )
+    return {**asdict(result), "calibration_set": cal.get("set")}
 
 
 def _arrays(correct: dict[str, list[bool]], names: list[str]) -> dict[str, np.ndarray]:
@@ -525,10 +650,12 @@ def _arrays(correct: dict[str, list[bool]], names: list[str]) -> dict[str, np.nd
 
 def _baseline(run: _Run, correct: dict[str, list[bool]]) -> BaselineCheck:
     names = [b.name for b in run.suite.by_group("target")]
-    n_options = {
-        n: Counter(len(item.options) for item in run.items[n]).most_common(1)[0][0] for n in names
-    }
-    return baseline_check(_arrays(correct, names), n_options, run.profile.baseline_margin)
+    chance = {}
+    for name in names:
+        items = run.items[name]
+        k = Counter(len(item.options) for item in items).most_common(1)[0][0]
+        chance[name] = chance_level([item.answer for item in items], k)
+    return baseline_check(_arrays(correct, names), chance, run.profile.baseline_margin)
 
 
 def _impact(run: _Run, base: dict, tuned: dict, control: dict) -> dict:
@@ -559,6 +686,26 @@ def _impact(run: _Run, base: dict, tuned: dict, control: dict) -> dict:
     }
 
 
+def _evaluation(run: _Run) -> dict | None:
+    """How the eval steps scored: protocol, shot item IDs and truncation; None for a scan."""
+    base = run.outputs.get("eval_base")
+    if base is None:
+        return None
+    return {
+        "protocol": PROTOCOL,
+        "n_shots": N_SHOTS,
+        "max_len": run.profile.scan.eval_max_len,
+        "shots": {
+            b.name: {
+                "split": b.shot_split or b.split,
+                "item_ids": [s.item_id for s in run.shots[b.name]],
+            }
+            for b in run.suite.benchmarks
+        },
+        "n_truncated": base["n_truncated"],
+    }
+
+
 def _compute(run: _Run) -> dict:
     trained = [out["train"] for out in run.outputs.values() if "train" in out]
     return {
@@ -583,11 +730,11 @@ def _finish(run: _Run, status: str, results: dict, ds: dict, target: dict) -> Ru
         suite_version=run.suite.version,
         env=env_info(run.device),
         dataset={
-            "path": str(req.data_path),
+            "name": req.data_path.name,  # no absolute path: request.json keeps that
             "fingerprint": ds["fingerprint"],
             "n_total": ds["n_total"],
             "n_scanned": len(ds["scan_lines"]),
-            "n_trained": len(ds["train_lines"]),
+            "n_trained": len(ds["train_lines"]) if status == "complete" else None,
             "declared_type": req.declared_type,
             "declared_date_range": _date_range(req),
         },
@@ -597,12 +744,14 @@ def _finish(run: _Run, status: str, results: dict, ds: dict, target: dict) -> Ru
             "params": target["n_params"],
             "family": model_info(req.model_id).family,
             "reference_id": req.reference_id,
+            "reference_revision": run.reference_revision,
             "unseen_after": req.unseen_after.isoformat() if req.unseen_after else None,
         },
         seeds=list(run.profile.seeds),
         config=asdict(run.profile),
         results=results,
         compute=_compute(run),
+        evaluation=_evaluation(run),
     )
     (run.dir / "report.md").write_text(render_report(asdict(record)), encoding="utf-8")
     corpus = req.home / "corpus.jsonl"

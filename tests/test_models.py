@@ -5,26 +5,35 @@ import torch
 
 from dvx.models import REGISTRY, model_info, pick_device, release
 
+BASE_REVISIONS = {
+    "Qwen/Qwen3-0.6B-Base": "da87bfb608c14b7cf20ba1ce41287e8de496c0cd",
+    "Qwen/Qwen3-1.7B-Base": "ea980cb0a6c2ae4b936e82123acc929f1cec04c1",
+    "Qwen/Qwen3-4B-Base": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+    "Qwen/Qwen3-8B-Base": "49e3418fbbbca6ecbdf9608b4d22e5a407081db4",
+}
 
-def test_registry_qwen3():
-    i = model_info("Qwen/Qwen3-0.6B")
-    assert i.reference_id == "Qwen/Qwen3-1.7B" and i.unseen_after == date(2025, 5, 1)
-    assert i.revision == "c1899de289a04d12100db370d81485cdf75e47ca"
+
+def test_registry_qwen3_base():
+    i = model_info("Qwen/Qwen3-0.6B-Base")
+    assert i.reference_id == "Qwen/Qwen3-1.7B-Base" and i.unseen_after == date(2025, 5, 1)
+    assert i.revision == "da87bfb608c14b7cf20ba1ce41287e8de496c0cd"
+    assert (i.family, i.params_b, i.pretrain_tokens) == ("qwen3", 0.6, 36e12)
 
 
-def test_registry_revisions():
-    assert {k: v.revision for k, v in REGISTRY.items()} == {
-        "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca",
-        "Qwen/Qwen3-1.7B": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
-        "Qwen/Qwen3-4B": "1cfa9a7208912126459214e8b04321603b3df60c",
-        "Qwen/Qwen3-8B": "b968826d9c46dd6066d109eabc6255188de91218",
-    }
+def test_registry_holds_only_pinned_base_checkpoints():
+    assert {k: v.revision for k, v in REGISTRY.items()} == BASE_REVISIONS
 
 
 def test_reference_chain():
-    assert model_info("Qwen/Qwen3-1.7B").reference_id == "Qwen/Qwen3-4B"
-    assert model_info("Qwen/Qwen3-4B").reference_id == "Qwen/Qwen3-8B"
-    assert model_info("Qwen/Qwen3-8B").reference_id is None
+    assert model_info("Qwen/Qwen3-1.7B-Base").reference_id == "Qwen/Qwen3-4B-Base"
+    assert model_info("Qwen/Qwen3-4B-Base").reference_id == "Qwen/Qwen3-8B-Base"
+    assert model_info("Qwen/Qwen3-8B-Base").reference_id is None
+
+
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B"])
+def test_post_trained_checkpoints_are_unregistered(model_id):
+    i = model_info(model_id)
+    assert (i.family, i.revision, i.reference_id) == ("unknown", None, None)
 
 
 def test_unknown_model():
