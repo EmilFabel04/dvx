@@ -13,8 +13,8 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from dvx.config import TrainConfig
 from dvx.data import Example
-from dvx.models import count_params
-from dvx.prompting import IGNORE, EncodedExample, encode_sft
+from dvx.models import count_params, release_cached_memory
+from dvx.prompting import IGNORE, EncodedExample, encode_sft, padded_width
 
 
 @dataclass(frozen=True)
@@ -32,9 +32,9 @@ class TrainStats:
 
 
 def _collate(
-    batch: list[EncodedExample], pad_id: int, device: torch.device
+    batch: list[EncodedExample], pad_id: int, device: torch.device, max_len: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    width = max(len(e.input_ids) for e in batch)
+    width = padded_width(max(len(e.input_ids) for e in batch), max_len)
     ids, labels, mask = [], [], []
     for e in batch:
         pad = width - len(e.input_ids)
@@ -118,7 +118,7 @@ def finetune_lora(
         optimizer.zero_grad()
         step_loss = 0.0
         for batch in group:
-            ids, labels, mask = _collate(batch, pad_id, device)
+            ids, labels, mask = _collate(batch, pad_id, device, cfg.max_seq_len)
             loss = peft_model(input_ids=ids, attention_mask=mask, labels=labels).loss
             (loss / len(group)).backward()
             step_loss += loss.item() / len(group)
@@ -128,6 +128,7 @@ def finetune_lora(
         final_loss = float(step_loss)
     wall = time.perf_counter() - start
     peft_model.eval()
+    release_cached_memory(device)
 
     stats = TrainStats(
         n_examples=len(examples),

@@ -61,3 +61,30 @@ def test_adapter_float32_with_bf16_base():
     m2, _ = finetune_lora(m, tok, _exs(2), TrainConfig(epochs=1, max_seq_len=64), seed=0)
     trainable = [p for p in m2.parameters() if p.requires_grad]
     assert trainable and all(p.dtype == torch.float32 for p in trainable)
+
+
+def test_collate_pads_to_multiple_of_64_with_ignored_labels():
+    from dvx.prompting import IGNORE, EncodedExample
+    from dvx.train import _collate
+
+    batch = [
+        EncodedExample([5, 6, 7], [IGNORE, 6, 7], False),
+        EncodedExample(list(range(10, 80)), [IGNORE] * 10 + list(range(20, 80)), False),
+    ]
+    ids, labels, mask = _collate(batch, 0, torch.device("cpu"), 512)
+    assert ids.shape == labels.shape == mask.shape == (2, 128)
+    assert ids[0, :3].tolist() == [5, 6, 7] and (ids[0, 3:] == 0).all()
+    assert labels[0, :3].tolist() == [IGNORE, 6, 7] and (labels[0, 3:] == IGNORE).all()
+    assert (labels[1, 70:] == IGNORE).all() and labels[1, 10:70].tolist() == list(range(20, 80))
+    assert mask.sum(-1).tolist() == [3, 70] and (mask[1, 70:] == 0).all()
+    assert _collate(batch, 0, torch.device("cpu"), 100)[0].shape == (2, 100)
+
+
+def test_finetune_releases_cached_memory_once(monkeypatch):
+    import dvx.train
+
+    m, tok = load_model(TINY, TINY_REV, "cpu")
+    calls = []
+    monkeypatch.setattr(dvx.train, "release_cached_memory", calls.append)
+    finetune_lora(m, tok, _exs(4), TrainConfig(epochs=1, max_seq_len=64), seed=0)
+    assert [d.type for d in calls] == ["cpu"]

@@ -75,13 +75,20 @@ def count_params(model: PreTrainedModel) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def release_cached_memory(device: torch.device | str) -> None:
+    """Return the memory PyTorch's caching allocator holds unused on `device` (MPS or
+    CUDA) to the system. Live tensors are untouched; a no-op on CPU."""
+    kind = torch.device(device).type
+    if kind == "mps":
+        torch.mps.empty_cache()
+    elif kind == "cuda":
+        torch.cuda.empty_cache()
+
+
 def release(model: PreTrainedModel) -> None:
     """Free the model's parameter memory. The model is unusable afterwards."""
     first = next(model.parameters(), None)
-    device = first.device.type if first is not None else "cpu"
+    device = first.device if first is not None else torch.device("cpu")
     model.to("meta")
     gc.collect()
-    if device == "mps":
-        torch.mps.empty_cache()
-    elif device == "cuda":
-        torch.cuda.empty_cache()
+    release_cached_memory(device)

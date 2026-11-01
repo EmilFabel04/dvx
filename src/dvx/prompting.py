@@ -9,6 +9,7 @@ from dvx.evals.registry import MCQItem
 
 IGNORE = -100
 MIN_MAX_LEN = 8
+PAD_MULTIPLE = 64
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,17 @@ def render_mcq(tokenizer: PreTrainedTokenizerBase, item: MCQItem) -> str:
     if tokenizer.chat_template:
         return _apply_chat(tokenizer, [{"role": "user", "content": content}])
     return f"{content}\nAnswer:"
+
+
+def padded_width(longest: int, max_len: int) -> int:
+    """Width to pad a batch to: its longest row rounded up to a multiple of PAD_MULTIPLE,
+    capped at the encoder's max_len (never below the longest row).
+
+    Few distinct widths let a device's caching allocator reuse freed blocks across
+    batches instead of holding one set per width.
+    """
+    rounded = -(-longest // PAD_MULTIPLE) * PAD_MULTIPLE
+    return min(rounded, max(max_len, longest))
 
 
 def encode_sft(tokenizer: PreTrainedTokenizerBase, ex: Example, max_len: int) -> EncodedExample:
