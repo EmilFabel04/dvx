@@ -93,6 +93,47 @@ def _sft_loss(
     return total / (targets != IGNORE).sum()
 
 
+def _optimize(
+    peft_model: PeftModel,
+    groups: list[list[list[EncodedExample]]],
+    cfg: TrainConfig,
+    steps: int,
+    pad_id: int,
+    device: torch.device,
+) -> tuple[int, float]:
+    """One AdamW step per group of micro-batches; returns (tokens_trained, final_loss).
+
+    The optimizer, its state and the last batch are local, and gradients are set to
+    None at the end, so all of it is freed when this returns.
+    """
+    warmup = math.ceil(cfg.warmup_ratio * steps)
+
+    def lr_scale(step: int) -> float:
+        if step < warmup:
+            return (step + 1) / warmup
+        return max(0.0, (steps - step) / max(1, steps - warmup))
+
+    params = [p for p in peft_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
+    tokens_trained = 0
+    final_loss = float("nan")
+    for group in groups:
+        optimizer.zero_grad()
+        step_loss = 0.0
+        for batch in group:
+            ids, labels, mask = _collate(batch, pad_id, device, cfg.max_seq_len)
+            loss = _sft_loss(peft_model, ids, mask, labels)
+            (loss / len(group)).backward()
+            step_loss += loss.item() / len(group)
+            tokens_trained += int(mask.sum().item())
+        optimizer.step()
+        scheduler.step()
+        final_loss = float(step_loss)
+    optimizer.zero_grad(set_to_none=True)
+    return tokens_trained, final_loss
+
+
 def finetune_lora(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
@@ -149,38 +190,16 @@ def finetune_lora(
     groups = [micro[i : i + cfg.grad_accum] for i in range(0, len(micro), cfg.grad_accum)]
     steps = math.ceil(len(examples) * cfg.epochs / (cfg.micro_batch_size * cfg.grad_accum))
     assert steps == len(groups)
-    warmup = math.ceil(cfg.warmup_ratio * steps)
-
-    def lr_scale(step: int) -> float:
-        if step < warmup:
-            return (step + 1) / warmup
-        return max(0.0, (steps - step) / max(1, steps - warmup))
-
-    params = [p for p in peft_model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
 
     device = next(peft_model.parameters()).device
-    pad_id = tokenizer.pad_token_id
-    tokens_trained = 0
-    final_loss = float("nan")
     start = time.perf_counter()
     peft_model.train()
-    for group in groups:
-        optimizer.zero_grad()
-        step_loss = 0.0
-        for batch in group:
-            ids, labels, mask = _collate(batch, pad_id, device, cfg.max_seq_len)
-            loss = _sft_loss(peft_model, ids, mask, labels)
-            (loss / len(group)).backward()
-            step_loss += loss.item() / len(group)
-            tokens_trained += int(mask.sum().item())
-        optimizer.step()
-        scheduler.step()
-        final_loss = float(step_loss)
+    tokens_trained, final_loss = _optimize(
+        peft_model, groups, cfg, steps, tokenizer.pad_token_id, device
+    )
     wall = time.perf_counter() - start
     peft_model.eval()
-    release_cached_memory(device)
+    release_cached_memory(device)  # after _optimize's optimizer, grads and batches are gone
 
     stats = TrainStats(
         n_examples=len(examples),

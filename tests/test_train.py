@@ -180,3 +180,64 @@ def test_finetune_never_projects_full_sequence():
     exs = [Example("Q", "word " * 60, None, i) for i in range(8)]  # longer than a chunk
     finetune_lora(m, tok, exs, TrainConfig(epochs=1, max_seq_len=128), seed=0)
     assert widths and max(widths) <= train._LOSS_CHUNK
+
+
+def test_finetune_frees_optimizer_and_grads_before_releasing_cache(monkeypatch):
+    import weakref
+
+    import dvx.train
+
+    optimizers = []
+
+    class TrackedAdamW(torch.optim.AdamW):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            optimizers.append(weakref.ref(self))
+
+    m, tok = load_model(TINY, TINY_REV, "cpu")
+    at_release = []
+
+    def release(device):
+        no_grads = all(p.grad is None for p in m.parameters())
+        at_release.append(([r() is None for r in optimizers], no_grads))
+
+    monkeypatch.setattr(torch.optim, "AdamW", TrackedAdamW)
+    monkeypatch.setattr(dvx.train, "release_cached_memory", release)
+    tuned, _ = finetune_lora(m, tok, _exs(8), TrainConfig(max_seq_len=64), seed=0)
+    assert at_release == [([True], True)]  # optimizer gone, no grads, when the cache empties
+    assert all(p.grad is None for p in tuned.parameters())
+
+
+def test_sft_loss_matches_peft_loss_with_gradient_checkpointing():
+    from peft import LoraConfig, get_peft_model
+
+    from dvx import train
+
+    m, tok = load_model(TINY, TINY_REV, "cpu")
+    m.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    cfg = TrainConfig()
+    peft_model = get_peft_model(
+        m,
+        LoraConfig(
+            r=cfg.lora_r,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
+            target_modules=list(cfg.lora_target_modules),
+            task_type="CAUSAL_LM",
+        ),
+    )
+    peft_model.train()
+    assert m.is_gradient_checkpointing
+    ids, mask, labels = _sft_batch(tok, [2 * train._LOSS_CHUNK + 6, 9], n_prompt=5)
+
+    def seeded(loss_fn):
+        torch.manual_seed(0)  # the same LoRA dropout masks for both losses
+        return _loss_and_grads(peft_model, loss_fn)
+
+    got, got_grads = seeded(lambda: train._sft_loss(peft_model, ids, mask, labels))
+    ref, ref_grads = seeded(
+        lambda: peft_model(input_ids=ids, attention_mask=mask, labels=labels, use_cache=False).loss
+    )
+    assert torch.allclose(got, ref, rtol=1e-6, atol=0)
+    assert got_grads.keys() == ref_grads.keys() and all("lora_" in n for n in got_grads)
+    assert all(torch.allclose(got_grads[n], ref_grads[n], rtol=1e-4, atol=1e-7) for n in ref_grads)
