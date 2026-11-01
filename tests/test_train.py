@@ -105,8 +105,8 @@ def _one_step(checkpointing):
 
 
 def test_gradient_checkpointing_matches_plain_training():
-    # Default lora_dropout (0.05): non-reentrant checkpointing restores the RNG state
-    # when it recomputes, so dropout masks match.
+    # Default lora_dropout (0.05): torch.utils.checkpoint preserves RNG state on
+    # recompute by default (preserve_rng_state=True), so dropout masks match.
     loss_on, lora_on = _one_step(True)
     loss_off, lora_off = _one_step(False)
     assert abs(loss_on - loss_off) < 1e-6

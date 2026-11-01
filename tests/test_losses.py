@@ -152,18 +152,14 @@ def test_release_cached_memory_once_per_scoring_call(tiny, monkeypatch):
     assert [d.type for d in calls] == ["cpu", "cpu"]
 
 
-def test_target_logprobs_falls_back_for_unlisted_model_type(tiny, monkeypatch):
+def _assert_full_logits_fallback(model, tok):
     import torch
 
     from dvx.scan import losses
 
-    model, tok = tiny
     ids, mask = _padded_batch(tok, [2 * losses._CHUNK + 6, 9])
-    monkeypatch.setattr(model.config, "model_type", "gemma2")
     widths = []
-    hook = model.get_output_embeddings().register_forward_hook(
-        lambda mod, inp, out: widths.append(out.shape[1])
-    )
+    hook = model.lm_head.register_forward_hook(lambda mod, inp, out: widths.append(out.shape[1]))
     try:
         with torch.no_grad():
             got = losses._target_logprobs(model, ids, mask)
@@ -171,3 +167,25 @@ def test_target_logprobs_falls_back_for_unlisted_model_type(tiny, monkeypatch):
         hook.remove()
     assert widths == [ids.shape[1]]  # one full-sequence head call: the fallback
     assert torch.allclose(got, _reference_logprobs(model, ids, mask), atol=1e-5)
+
+
+def test_target_logprobs_falls_back_for_unlisted_model_type(tiny, monkeypatch):
+    model, tok = tiny
+    monkeypatch.setattr(model.config, "model_type", "gemma2")
+    _assert_full_logits_fallback(model, tok)
+
+
+def test_target_logprobs_falls_back_when_get_decoder_raises(tiny, monkeypatch):
+    model, tok = tiny
+
+    def unsupported():
+        raise NotImplementedError("no decoder accessor")
+
+    monkeypatch.setattr(model, "get_decoder", unsupported)
+    _assert_full_logits_fallback(model, tok)
+
+
+def test_target_logprobs_falls_back_when_decoder_contains_head(tiny, monkeypatch):
+    model, tok = tiny
+    monkeypatch.setattr(model, "get_decoder", lambda: model)  # transformers 5's last resort
+    _assert_full_logits_fallback(model, tok)

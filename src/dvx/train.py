@@ -77,7 +77,8 @@ def finetune_lora(
 
     n_params = count_params(model)
     if cfg.gradient_checkpointing:
-        # Non-reentrant, so frozen inputs need no grad hooks and dropout RNG is replayed.
+        # Non-reentrant: frozen inputs need no input-grad hook (peft adds one anyway).
+        # torch.utils.checkpoint preserves RNG state on recompute by default.
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     peft_model = get_peft_model(
         model,
