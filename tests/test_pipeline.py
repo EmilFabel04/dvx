@@ -145,7 +145,7 @@ def test_quick_end_to_end(tmp_path, monkeypatch):
     assert set(impact["delta_raw"]) == set(impact["delta_control"]) == GROUPS
     assert set(impact["accuracy"]) == {"base", "control", "tuned"}
     assert set(impact["per_benchmark_accuracy"]["tuned"]) == set(ITEMS)
-    assert rec.results["novelty"]["status"] == "ok"
+    assert rec.results["novelty"]["status"] == "inconclusive"  # reference == target
     assert rec.results["exposure"]["n_calibration"] == len(SEEN) + len(UNSEEN)
     assert rec.dataset["declared_date_range"] == ["2020-01-01", "2023-12-31"]
     assert rec.model["revision"] == TINY_REV and rec.model["unseen_after"] == "2024-01-01"
@@ -203,6 +203,30 @@ def test_eval_prompts_carry_the_shots(tmp_path, monkeypatch):
     start_run(make_request(tmp_path), **overrides())
     assert len(calls) == 3 * len(ITEMS)  # base, tuned, control
     assert all(shots == SHOTS[name] and max_len == 3072 for name, shots, max_len in calls)
+
+
+def test_novelty_gate_and_reliability_recorded(tmp_path):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    novelty = rec.results["novelty"]
+    # The tiny model is its own reference: identical losses, so the reference is never
+    # below the target and the gate makes novelty inconclusive.
+    assert novelty["status"] == "inconclusive"
+    assert novelty["reason"].startswith("the reference loss is below the target loss on only 0.0%")
+    assert novelty["reference"] == {"id": TINY, "revision": TINY_REV}
+    rel = novelty["reliability"]
+    assert rel["reference_below_target"] == 0.0
+    assert (rel["min_reference_below_target"], rel["min_paired_discrimination"]) == (0.5, 0.6)
+    assert 0.0 <= rel["paired_discrimination"] <= 1.0
+    assert novelty["known_margin"] == 0.1 and novelty["noise_percentile"] == 10.0
+    assert isinstance(novelty["noise_threshold"], float)
+    assert novelty["loss_quartiles"]["target"] == novelty["loss_quartiles"]["reference"]
+    assert len(novelty["loss_quartiles"]["target"]) == 3
+    shown = [e for bucket in novelty["examples"].values() for e in bucket]
+    assert shown and all(len(e["response"]) <= 80 for e in shown)
+    assert all(len(b) <= 2 for b in novelty["examples"].values())
+    ref = json.loads((run_dir(req, rec) / "steps" / "scan_reference.json").read_text())
+    assert len(ref["mismatched_true_index"]) == len(ref["mismatched_losses"]) == 12
 
 
 def test_baseline_stop(tmp_path):
@@ -339,7 +363,7 @@ def test_scan_only(tmp_path, monkeypatch):
     assert rec.status == "scan_only"
     assert rec.evaluation is None
     assert set(rec.results) == {"duplicates", "contamination", "novelty", "exposure"}
-    assert rec.results["novelty"]["status"] == "ok"
+    assert rec.results["novelty"]["status"] == "inconclusive"
     exposure = rec.results["exposure"]
     assert exposure["status"] == "inconclusive"
     assert exposure["reason"] == "model release date unknown; pass --unseen-after"

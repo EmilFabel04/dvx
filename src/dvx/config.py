@@ -32,6 +32,9 @@ class ScanConfig:
     known_margin: float = 0.1
     noise_percentile: float = 10.0
     mismatched_n: int = 200
+    # Novelty reliability gate: below either, novelty is "inconclusive".
+    novelty_min_reference_below_target: float = 0.5
+    novelty_min_paired_discrimination: float = 0.6
     min_k: float = 0.2
     exposure_min_auc: float = 0.6
     minhash_threshold: float = 0.8

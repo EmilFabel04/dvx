@@ -95,7 +95,26 @@ def sample_record(**overrides) -> dict:
                 "counts": {"known": 500, "learnable": 400, "noise": 100},
                 "fractions": {"known": 0.5, "learnable": 0.4, "noise": 0.1},
                 "noise_threshold": 5.0,
+                "noise_percentile": 10.0,
                 "known_margin": 0.1,
+                "n_excluded": 0,
+                "n_pairs_excluded": 0,
+                "reliability": {
+                    "reference_below_target": 0.72,
+                    "min_reference_below_target": 0.5,
+                    "paired_discrimination": 0.81,
+                    "min_paired_discrimination": 0.6,
+                },
+                "loss_quartiles": {"target": [1.2, 2.3, 3.1], "reference": [1.0, 2.0, 2.9]},
+                "reference": {"id": "Qwen/Qwen3-1.7B-Base", "revision": "refrev456"},
+                "examples": {
+                    "known": [
+                        {"line": 3, "prompt": "Which nerve?", "response": "B. Ulnar"},
+                        {"line": 9, "prompt": "Drug of choice?", "response": "A. Penicillin"},
+                    ],
+                    "learnable": [{"line": 4, "prompt": "Rare sign?", "response": "C. Kehr"}],
+                    "noise": [],
+                },
             },
             "exposure": {
                 "status": "ok",

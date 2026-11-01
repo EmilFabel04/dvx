@@ -19,6 +19,17 @@ CAVEATS = (
 )
 
 
+def _count(n: int, singular: str, plural: str | None = None) -> str:
+    """'1 example', '3 examples' (thousands separated)."""
+    return f"{n:,} {singular if n == 1 else plural or singular + 's'}"
+
+
+def _ordinal(x: float) -> str:
+    n = round(x)
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 def fmt_delta(e: dict) -> str:
     """Format an Estimate of a delta, in percentage points with its 95% CI."""
     text = f"{e['value']:+.1f} pp (95% CI {e['ci_low']:+.1f} to {e['ci_high']:+.1f})"
@@ -132,15 +143,59 @@ def _per_benchmark_table(impact: dict) -> list[str]:
 
 
 def _novelty_lines(novelty: dict) -> list[str]:
-    if novelty["status"] != "ok":
+    """Paragraphs: the bucket mix only when the gate passed, else the reason; either way the
+    reliability, reference, thresholds, loss quartiles and example items."""
+    if novelty["status"] == "unavailable":
         return [f"Novelty: unavailable ({novelty['reason']})"]
-    f = novelty["fractions"]
-    return [
-        (
-            f"Known to the model: {f['known']:.1%} · learnable: {f['learnable']:.1%} "
-            f"· noise: {f['noise']:.1%}"
+    ok = novelty["status"] == "ok"
+    if ok:
+        f = novelty["fractions"]
+        out = [
+            (
+                f"Known to the model: {f['known']:.1%} · learnable: {f['learnable']:.1%} "
+                f"· noise: {f['noise']:.1%}"
+            )
+        ]
+    else:
+        out = [f"Novelty: inconclusive ({novelty['reason']})."]
+    rel = novelty.get("reliability")
+    if rel:
+        out.append(
+            "Reliability: the reference loss is below the target loss on "
+            f"{rel['reference_below_target']:.1%} of examples "
+            f"(gate: at least {rel['min_reference_below_target']:.0%}); "
+            f"paired discrimination {rel['paired_discrimination']:.2f} "
+            f"(gate: at least {rel['min_paired_discrimination']:.2f})."
         )
-    ]
+    ref = novelty.get("reference")
+    if ref and novelty.get("noise_threshold") is not None:
+        out.append(
+            f"Reference model: {ref['id']} (revision {ref['revision']}). Thresholds: known "
+            f"margin {novelty['known_margin']:.2f} nats per token; noise threshold "
+            f"{novelty['noise_threshold']:.2f} nats per token (the "
+            f"{_ordinal(novelty['noise_percentile'])} percentile of mismatched-pair reference "
+            "loss)."
+        )
+    q = novelty.get("loss_quartiles")
+    if q:
+        t, r = (" / ".join(f"{v:.2f}" for v in q[k]) for k in ("target", "reference"))
+        out.append(f"Loss quartiles (nats per response token): target {t}; reference {r}.")
+    n_excluded = novelty.get("n_excluded")
+    if n_excluded:
+        verb = "was" if n_excluded == 1 else "were"
+        out.append(
+            f"{_count(n_excluded, 'example')} {verb} excluded from novelty (non-finite loss)."
+        )
+    shown = [(b, e) for b, items in (novelty.get("examples") or {}).items() for e in items]
+    if shown:
+        out.append(
+            "Example items:" if ok else "Example items, as the unreliable rule buckets them:"
+        )
+        out.append(
+            "\n".join(f'- {b}, line {e["line"]}: "{e["prompt"]}" → "{e["response"]}"'
+                      for b, e in shown)
+        )
+    return out
 
 
 def _exposure_lines(exposure: dict) -> list[str]:
@@ -217,7 +272,8 @@ def render_report(record: dict) -> str:
 
     out += ["## Data checks", ""]
     if "novelty" in results:
-        out += _novelty_lines(results["novelty"]) + [""]
+        for paragraph in _novelty_lines(results["novelty"]):
+            out += [paragraph, ""]
     if "exposure" in results:
         out += _exposure_lines(results["exposure"]) + [""]
     if "duplicates" in results:

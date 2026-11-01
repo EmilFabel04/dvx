@@ -55,7 +55,13 @@ from dvx.scan.calibration import CalibrationUnavailable, fetch_calibration_texts
 from dvx.scan.duplicates import duplicate_stats
 from dvx.scan.exposure import assess_exposure, exposure_inconclusive, min_k_score
 from dvx.scan.losses import response_losses, token_logprobs
-from dvx.scan.novelty import classify, mismatched_pairs, novelty_unavailable
+from dvx.scan.novelty import (
+    NoveltyResult,
+    bucket_examples,
+    classify,
+    mismatched_pairs,
+    novelty_unavailable,
+)
 from dvx.train import finetune_lora
 
 GROUPS: tuple[Group, ...] = get_args(Group)
@@ -352,15 +358,8 @@ def _execute(run: _Run) -> RunRecord:
         novelty = novelty_unavailable(skip, len(scan))
     else:
         ref = run.step("scan_reference", lambda: _scan_reference_step(run, scan))
-        cfg = run.profile.scan
-        novelty = classify(
-            target["losses"],
-            ref["losses"],
-            ref["mismatched_losses"],
-            cfg.known_margin,
-            cfg.noise_percentile,
-        )
-    results["novelty"] = novelty.summary()
+        novelty = _novelty(run, target, ref)
+    results["novelty"] = _novelty_summary(run, novelty, scan)
     results["exposure"] = _exposure(run, target)
     if run.scan_only:
         return _finish(run, "scan_only", results, ds, target)
@@ -435,11 +434,12 @@ def _scan_target_step(run: _Run, scan: list[Example]) -> dict:
 
 
 def _scan_reference_step(run: _Run, scan: list[Example]) -> dict:
-    mismatched = mismatched_pairs(scan, run.profile.scan.mismatched_n, seed=SEED)
+    mismatched, true_index = mismatched_pairs(scan, run.profile.scan.mismatched_n, seed=SEED)
     with _loaded(run.req.reference_id, _reference_revision(run.req), run.device) as (model, tok):
         return {
             "losses": _losses(run, model, tok, scan),
             "mismatched_losses": _losses(run, model, tok, mismatched),
+            "mismatched_true_index": true_index,  # scan index of each pair's true pair
         }
 
 
@@ -484,14 +484,16 @@ def _calibration_texts(run: _Run) -> tuple[list[str], list[str], str | None]:
     return seen, unseen, None
 
 
-def _losses(run: _Run, model, tok, examples: list[Example]) -> list[float]:
-    return response_losses(
+def _losses(run: _Run, model, tok, examples: list[Example]) -> list[float | None]:
+    """Response losses; a non-finite one is stored as JSON null (classify excludes it)."""
+    losses = response_losses(
         model,
         tok,
         examples,
         max_len=run.profile.train.max_seq_len,
         batch_size=run.profile.scan.batch_size,
     )
+    return [v if np.isfinite(v) else None for v in losses]
 
 
 def _min_k_scores(run: _Run, model, tok, texts: list[str]) -> list[float | None]:
@@ -538,6 +540,30 @@ def _reference_skip(req: RunRequest, scan: list[Example]) -> str | None:
     if len(scan) < 2:
         return TOO_FEW_EXAMPLES
     return None
+
+
+def _novelty(run: _Run, target: dict, ref: dict) -> NoveltyResult:
+    cfg = run.profile.scan
+    return classify(
+        target["losses"],
+        ref["losses"],
+        ref["mismatched_losses"],
+        [ref["losses"][j] for j in ref["mismatched_true_index"]],
+        cfg.known_margin,
+        cfg.noise_percentile,
+        cfg.novelty_min_reference_below_target,
+        cfg.novelty_min_paired_discrimination,
+    )
+
+
+def _novelty_summary(run: _Run, novelty: NoveltyResult, scan: list[Example]) -> dict:
+    """The novelty record: the result, the reference that produced it, example items."""
+    ref = run.req.reference_id
+    return {
+        **novelty.summary(),
+        "reference": None if ref is None else {"id": ref, "revision": _reference_revision(run.req)},
+        "examples": bucket_examples(novelty.labels, scan),
+    }
 
 
 def _exposure(run: _Run, target: dict) -> dict:

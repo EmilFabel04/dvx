@@ -59,7 +59,7 @@ def test_per_benchmark_table():
 
 def test_novelty_ok_and_unavailable():
     r = render_report(sample_record())
-    assert "50.0%" in r and "40.0%" in r and "10.0%" in r
+    assert "Known to the model: 50.0% · learnable: 40.0% · noise: 10.0%" in r
     rec = sample_record(
         results={
             "novelty": {
@@ -71,6 +71,70 @@ def test_novelty_ok_and_unavailable():
         }
     )
     assert "Novelty: unavailable (no reference model)" in render_report(rec)
+
+
+NOVELTY_DETAIL = (
+    (
+        "Reliability: the reference loss is below the target loss on 72.0% of examples "
+        "(gate: at least 50%); paired discrimination 0.81 (gate: at least 0.60)."
+    ),
+    (
+        "Reference model: Qwen/Qwen3-1.7B-Base (revision refrev456). Thresholds: known margin "
+        "0.10 nats per token; noise threshold 5.00 nats per token (the 10th percentile of "
+        "mismatched-pair reference loss)."
+    ),
+    (
+        "Loss quartiles (nats per response token): target 1.20 / 2.30 / 3.10; "
+        "reference 1.00 / 2.00 / 2.90."
+    ),
+    '- known, line 3: "Which nerve?" → "B. Ulnar"',
+    '- known, line 9: "Drug of choice?" → "A. Penicillin"',
+    '- learnable, line 4: "Rare sign?" → "C. Kehr"',
+)
+
+
+def test_novelty_shows_reliability_reference_thresholds_quartiles_examples():
+    r = render_report(sample_record())
+    for line in NOVELTY_DETAIL:
+        assert line in r
+    assert r.index("Known to the model") < r.index("Reliability:") < r.index("- known, line 3")
+
+
+def test_inconclusive_novelty_hides_the_mix_but_shows_its_reliability():
+    reason = (
+        "the reference loss is below the target loss on only 0.7% of examples "
+        "(gate: at least 50%)"
+    )
+    rec = sample_record(
+        results={
+            "novelty": {
+                "status": "inconclusive",
+                "reason": reason,
+                "reliability": {"reference_below_target": 0.007},
+            }
+        }
+    )
+    r = render_report(rec)
+    assert f"Novelty: inconclusive ({reason})." in r
+    assert "Known to the model" not in r
+    assert "below the target loss on 0.7% of examples (gate: at least 50%)" in r
+    assert "Example items, as the unreliable rule buckets them:" in r
+    for line in NOVELTY_DETAIL[1:]:
+        assert line in r
+
+
+def test_novelty_counts_excluded_examples():
+    rec = sample_record(results={"novelty": {"n_excluded": 3}})
+    assert "3 examples were excluded from novelty (non-finite loss)." in render_report(rec)
+    assert "excluded from novelty" not in render_report(sample_record())
+
+
+def test_schema_1_novelty_still_renders():
+    rec = sample_record()
+    for key in ("reliability", "loss_quartiles", "reference", "examples", "n_excluded"):
+        rec["results"]["novelty"].pop(key)
+    r = render_report(rec)
+    assert "Known to the model: 50.0%" in r and "Reliability:" not in r
 
 
 def test_exposure_ok_and_inconclusive():

@@ -24,6 +24,8 @@ def test_train_defaults():
 def test_scan_defaults():
     s = ScanConfig()
     assert (s.known_margin, s.noise_percentile, s.mismatched_n) == (0.1, 10.0, 200)
+    assert s.novelty_min_reference_below_target == 0.5
+    assert s.novelty_min_paired_discrimination == 0.6
     assert (s.min_k, s.exposure_min_auc, s.calibration_per_side) == (0.2, 0.6, 200)
     assert (s.minhash_threshold, s.shingle_words, s.num_perm) == (0.8, 5, 128)
     assert (s.score_max_len, s.batch_size) == (1024, 8)
