@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 API_URL = "https://en.wikipedia.org/w/api.php"
+CALIBRATION_SOURCE = "English Wikipedia article intros"
 USER_AGENT = "dvx/0.1 (https://github.com/EmilFabel04/dvx)"
 # The enwiki letype=create log begins on 2018-06-27, so earlier starts collapse onto it.
 SEEN_STARTS = [
@@ -28,6 +31,23 @@ MAX_PAGES_PER_START = 10
 
 class CalibrationUnavailable(RuntimeError):
     """Calibration texts could not be obtained."""
+
+
+@dataclass(frozen=True)
+class CalibrationSet:
+    """Seen and unseen texts, and the date (ISO) they were fetched; None if unrecorded."""
+
+    seen: list[str]
+    unseen: list[str]
+    fetched_on: str | None
+
+
+def calibration_sha256(seen: list[str], unseen: list[str]) -> str:
+    """SHA-256 of the texts as compact JSON {"seen": [...], "unseen": [...]} (UTF-8)."""
+    blob = json.dumps(
+        {"seen": seen, "unseen": unseen}, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def wikipedia_get(params: dict) -> dict:
@@ -100,15 +120,16 @@ def fetch_calibration_texts(
     fetch_json: Callable[[dict], dict] = wikipedia_get,
     *,
     today: date | None = None,
-) -> tuple[list[str], list[str]]:
-    """Return (seen, unseen) Wikipedia intros; raises CalibrationUnavailable on failure."""
+) -> CalibrationSet:
+    """Seen and unseen Wikipedia intros, cached with their fetch date; raises
+    CalibrationUnavailable on failure."""
     cache_dir = Path(cache_dir)
     cache = cache_dir / f"wiki_v2_{unseen_after.isoformat()}_{n_per_side}.json"
     if cache.exists():
         try:
             blob = json.loads(cache.read_text(encoding="utf-8"))
-            return list(blob["seen"]), list(blob["unseen"])
-        except (OSError, ValueError, KeyError, TypeError):
+            return CalibrationSet(list(blob["seen"]), list(blob["unseen"]), blob.get("fetched_on"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass  # unreadable cache: refetch
     today = today or date.today()
     unseen_starts = [unseen_after + timedelta(days=d) for d in UNSEEN_OFFSETS_DAYS]
@@ -129,6 +150,8 @@ def fetch_calibration_texts(
         raise CalibrationUnavailable(
             f"too few calibration texts (seen {len(seen)}, unseen {len(unseen)}, need {need})"
         )
+    fetched = CalibrationSet(seen, unseen, fetched_on=today.isoformat())
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps({"seen": seen, "unseen": unseen}), encoding="utf-8")
-    return seen, unseen
+    blob = {"seen": seen, "unseen": unseen, "fetched_on": fetched.fetched_on}
+    cache.write_text(json.dumps(blob), encoding="utf-8")
+    return fetched

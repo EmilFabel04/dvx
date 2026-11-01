@@ -1,13 +1,17 @@
 import json
+import platform
+import re
 from dataclasses import asdict
 from datetime import datetime
 
 import pytest
 
+from dvx import record
 from dvx.record import (
     SCHEMA_VERSION,
     RunRecord,
     append_to_corpus,
+    engine_source,
     env_info,
     new_run_id,
     read_corpus,
@@ -102,5 +106,31 @@ def test_append_after_unterminated_complete_line(tmp_path):
 
 
 def test_env_info():
-    assert set(env_info("cpu")) == {"python", "platform", "torch", "transformers", "peft",
-                                    "datasets", "device", "dvx"}
+    env = env_info("cpu")
+    assert set(env) == {
+        "python", "platform", "torch", "transformers", "peft", "datasets", "device", "dvx",
+        "dvx_commit", "dvx_dirty", "machine", "processor", "device_name", "ram_bytes",
+    }  # fmt: skip
+    assert env["device"] == "cpu" and env["ram_bytes"] > 0
+    assert env["machine"] == platform.machine()
+    assert env["device_name"] == env["processor"]  # cpu (and mps): the chip
+
+
+def test_engine_source_in_this_checkout():
+    src = engine_source()
+    assert re.fullmatch(r"[0-9a-f]{40}", src["commit"]) and isinstance(src["dirty"], bool)
+
+
+def test_engine_source_without_git(monkeypatch):
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(record.subprocess, "run", no_git)
+    assert engine_source() == {"commit": None, "dirty": None}
+
+
+def test_engine_source_ignores_an_enclosing_repository(monkeypatch, tmp_path):
+    # An installed dvx inside some other git repo must not report that repo's commit.
+    monkeypatch.setattr(record, "_PACKAGE_DIR", tmp_path / "site-packages" / "dvx")
+    (tmp_path / "site-packages" / "dvx").mkdir(parents=True)
+    assert engine_source() == {"commit": None, "dirty": None}

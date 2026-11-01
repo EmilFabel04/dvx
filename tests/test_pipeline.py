@@ -14,7 +14,7 @@ from dvx.evals.registry import MCQItem, get_suite
 from dvx.record import read_corpus
 from dvx.run import pipeline
 from dvx.run.pipeline import RunRequest, resume_run, run_scan, start_run
-from dvx.scan.calibration import CalibrationUnavailable
+from dvx.scan.calibration import CalibrationSet, CalibrationUnavailable, calibration_sha256
 
 GROUPS = {"target", "adjacent", "side_effect"}
 ITEMS = {
@@ -45,7 +45,7 @@ UNSEEN = [f"Article {i} reports a new event that happened in late {2025 + i}." f
 
 
 def fake_fetcher(unseen_after, n_per_side, cache_dir):
-    return SEEN, UNSEEN
+    return CalibrationSet(SEEN, UNSEEN, fetched_on="2026-10-30")
 
 
 def offline_fetcher(unseen_after, n_per_side, cache_dir):
@@ -249,12 +249,73 @@ def test_novelty_gate_and_reliability_recorded(tmp_path):
     assert len(ref["mismatched_true_index"]) == len(ref["mismatched_losses"]) == 12
 
 
+def test_reproducibility_fields(tmp_path):
+    req = make_request(tmp_path)
+    rec = start_run(req, **overrides())
+    assert (rec.model["reference_id"], rec.model["reference_revision"]) == (TINY, TINY_REV)
+    assert rec.results["exposure"]["calibration_set"] == {
+        "source": "English Wikipedia article intros",
+        "sha256": calibration_sha256(SEEN, UNSEEN),
+        "fetched_on": "2026-10-30",
+        "n_seen": len(SEEN),
+        "n_unseen": len(UNSEEN),
+    }
+    env = rec.env
+    assert re.fullmatch(r"[0-9a-f]{40}", env["dvx_commit"]) and isinstance(env["dvx_dirty"], bool)
+    for key in ("machine", "processor", "device_name", "ram_bytes"):
+        assert env[key], key
+    request = json.loads((run_dir(req, rec) / "request.json").read_text())
+    assert request["engine"] == {"commit": env["dvx_commit"], "dirty": env["dvx_dirty"]}
+    assert rec.dataset["n_trained"] == 8
+
+
+def test_unregistered_reference_without_revision_records_the_loaded_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "_reference_revision", lambda req: None)
+    loads = spy(monkeypatch, "load_model")
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    assert [rev for _, rev, _ in loads] == [TINY_REV, None]  # target pinned; reference unpinned
+    assert rec.model["reference_revision"] == TINY_REV  # the HF cache snapshot it loaded
+    assert rec.results["novelty"]["reference"] == {"id": TINY, "revision": TINY_REV}
+    step = json.loads((run_dir(req, rec) / "steps" / "scan_reference.json").read_text())
+    assert step["commit"] == TINY_REV
+
+
+def test_no_calibration_set_without_calibration(tmp_path):
+    rec = run_scan(make_request(tmp_path), **overrides(calibration_fetcher=offline_fetcher))
+    assert rec.results["exposure"]["calibration_set"] is None
+
+
+def test_resume_warns_when_the_engine_source_changed(tmp_path, monkeypatch, capsys):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    (run_dir(req, rec) / "record.json").unlink()
+    started = json.loads((run_dir(req, rec) / "request.json").read_text())["engine"]
+    capsys.readouterr()
+    other = {"commit": "f" * 40, "dirty": True}
+    monkeypatch.setattr(pipeline, "engine_source", lambda: other)
+    resume_run(rec.run_id, req.home, **overrides())
+    err = capsys.readouterr().err
+    assert f"dvx: warning: run {rec.run_id} was started with dvx commit {started['commit']}" in err
+    assert f"now {'f' * 40} (dirty)" in err
+
+
+def test_resume_is_quiet_when_the_engine_source_matches(tmp_path, capsys):
+    req = make_request(tmp_path)
+    rec = run_scan(req, **overrides())
+    (run_dir(req, rec) / "record.json").unlink()
+    capsys.readouterr()
+    resume_run(rec.run_id, req.home, **overrides())
+    assert "warning" not in capsys.readouterr().err
+
+
 def test_baseline_stop(tmp_path):
     req = make_request(tmp_path)
     rec = start_run(
         req, **overrides(profile_obj=dataclasses.replace(PROFILE, baseline_margin=0.99))
     )
     assert rec.status == "stopped_baseline"
+    assert rec.dataset["n_trained"] is None
     assert set(rec.results) == {"duplicates", "contamination", "novelty", "exposure", "baseline"}
     out = run_dir(req, rec)
     assert not (out / "steps" / "tuned_s0.json").exists()
@@ -413,7 +474,7 @@ def test_sample_counts(tmp_path):
     rec = run_scan(req, **overrides(profile_obj=dataclasses.replace(PROFILE, measure_cap=10)))
     assert rec.dataset["n_total"] == 12
     assert rec.dataset["n_scanned"] == 10
-    assert rec.dataset["n_trained"] == 8
+    assert rec.dataset["n_trained"] is None  # a scan trains nothing
     assert rec.results["duplicates"]["n"] == 12
     assert sum(rec.results["novelty"]["counts"].values()) == 10
 

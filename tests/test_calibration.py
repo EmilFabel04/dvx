@@ -1,9 +1,16 @@
+import json
+import re
 from datetime import date, timedelta
 
 import pytest
 
 from dvx.scan import calibration
-from dvx.scan.calibration import CalibrationUnavailable, fetch_calibration_texts
+from dvx.scan.calibration import (
+    CalibrationSet,
+    CalibrationUnavailable,
+    calibration_sha256,
+    fetch_calibration_texts,
+)
 
 
 class FakeWiki:
@@ -55,19 +62,37 @@ class FakeWiki:
 def test_fetch_uses_cache(tmp_path):
     fake = FakeWiki()
     today = date(2026, 10, 30)
-    seen, unseen = fetch_calibration_texts(
+    got = fetch_calibration_texts(
         date(2025, 1, 1), 16, tmp_path / "c", fetch_json=fake, today=today
     )
+    seen, unseen = got.seen, got.unseen
     assert len(seen) == 16 and len(unseen) == 16
     assert all(400 <= len(t) <= 1000 for t in seen + unseen)
+    assert got.fetched_on == "2026-10-30"
     n = len(fake.calls)
     assert n > 0
-    assert (tmp_path / "c" / "wiki_v2_2025-01-01_16.json").exists()
+    cache = tmp_path / "c" / "wiki_v2_2025-01-01_16.json"
+    assert json.loads(cache.read_text())["fetched_on"] == "2026-10-30"
     again = fetch_calibration_texts(
-        date(2025, 1, 1), 16, tmp_path / "c", fetch_json=fake, today=today
+        date(2025, 1, 1), 16, tmp_path / "c", fetch_json=fake, today=date(2027, 1, 1)
     )
-    assert again == (seen, unseen)
+    assert again == got  # the fetch date is the cache's, not today's
     assert len(fake.calls) == n
+
+
+def test_cache_without_a_fetch_date_reads_as_unknown(tmp_path):
+    cache = tmp_path / "wiki_v2_2025-01-01_16.json"
+    cache.write_text(json.dumps({"seen": ["s"], "unseen": ["u"]}))  # written before the field
+    got = fetch_calibration_texts(date(2025, 1, 1), 16, tmp_path, fetch_json=None)
+    assert got == CalibrationSet(["s"], ["u"], fetched_on=None)
+
+
+def test_calibration_sha256_covers_both_sides_in_order():
+    digest = calibration_sha256(["a", "b"], ["c"])
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    assert digest == calibration_sha256(["a", "b"], ["c"])
+    assert digest != calibration_sha256(["b", "a"], ["c"])
+    assert digest != calibration_sha256(["a"], ["b", "c"])
 
 
 def test_params_and_future_dates_skipped(tmp_path):
@@ -90,10 +115,10 @@ def test_params_and_future_dates_skipped(tmp_path):
 
 def test_short_intros_filtered(tmp_path):
     fake = FakeWiki(short_every=2)
-    seen, unseen = fetch_calibration_texts(
+    got = fetch_calibration_texts(
         date(2025, 1, 1), 16, tmp_path, fetch_json=fake, today=date(2026, 10, 30)
     )
-    assert len(seen) == 16 and all(len(t) >= 400 for t in seen + unseen)
+    assert len(got.seen) == 16 and all(len(t) >= 400 for t in got.seen + got.unseen)
 
 
 def test_too_few_texts_raises(tmp_path):
@@ -132,9 +157,10 @@ def test_events_far_from_requested_start_dropped(tmp_path):
 
 def test_disambiguation_and_list_pages_excluded(tmp_path):
     fake = FakeWiki(bad_titles=True)
-    seen, unseen = fetch_calibration_texts(
+    got = fetch_calibration_texts(
         date(2025, 1, 1), 16, tmp_path, fetch_json=fake, today=date(2026, 10, 30)
     )
+    seen, unseen = got.seen, got.unseen
     assert len(seen) == 16 and len(unseen) == 16
     requested = [
         t for c in fake.calls if c.get("prop") == "extracts" for t in c["titles"].split("|")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -51,6 +52,7 @@ from dvx.record import (
     SCHEMA_VERSION,
     RunRecord,
     append_to_corpus,
+    engine_source,
     env_info,
     new_run_id,
     read_corpus,
@@ -58,7 +60,13 @@ from dvx.record import (
 )
 from dvx.report import render_report
 from dvx.run.steps import cached_step, write_json_atomic
-from dvx.scan.calibration import CalibrationUnavailable, fetch_calibration_texts
+from dvx.scan.calibration import (
+    CALIBRATION_SOURCE,
+    CalibrationSet,
+    CalibrationUnavailable,
+    calibration_sha256,
+    fetch_calibration_texts,
+)
 from dvx.scan.duplicates import duplicate_stats
 from dvx.scan.exposure import assess_exposure, exposure_inconclusive, min_k_score
 from dvx.scan.losses import response_losses, token_logprobs
@@ -78,7 +86,7 @@ NO_REFERENCE = "no reference model"
 TOO_FEW_EXAMPLES = "need at least 2 examples"
 _SNAPSHOT = re.compile(r"snapshots/([0-9a-f]{40})/")
 
-CalibrationFetcher = Callable[[date, int, Path], tuple[list[str], list[str]]]
+CalibrationFetcher = Callable[[date, int, Path], CalibrationSet]
 ControlLoader = Callable[[int, int], list[Example]]
 
 
@@ -114,6 +122,7 @@ class _Run:
     calibration_fetcher: CalibrationFetcher
     control_loader: ControlLoader
     outputs: dict[str, dict] = field(default_factory=dict)
+    reference_revision: str | None = None  # resolved when the reference step runs
 
     @property
     def dir(self) -> Path:
@@ -199,6 +208,7 @@ def resume_run(
     if record_path.exists():
         return RunRecord(**json.loads(record_path.read_text(encoding="utf-8")))
     saved = json.loads(request_path.read_text(encoding="utf-8"))
+    _warn_if_engine_changed(run_id, saved.get("engine", {"commit": None, "dirty": None}))
     profile = _profile_from_json(saved["profile"])
     if profile_obj is not None and profile_obj != profile:
         raise DvxUserError(
@@ -234,9 +244,25 @@ def _new_run(req: RunRequest, *, scan_only: bool, now: datetime | None, **resolv
         "scan_only": scan_only,
         "profile": asdict(run.profile),
         "request": _request_to_json(run.req),
+        "engine": engine_source(),
     }
     write_json_atomic(run.dir / "request.json", request, indent=2)
     return _execute(run)
+
+
+def _describe(source: dict) -> str:
+    commit = source.get("commit") or "unknown"
+    return commit + (" (dirty)" if source.get("dirty") else "")
+
+
+def _warn_if_engine_changed(run_id: str, started: dict) -> None:
+    now = engine_source()
+    if started != now:
+        print(
+            f"dvx: warning: run {run_id} was started with dvx commit {_describe(started)}, "
+            f"now {_describe(now)}; its cached steps came from the earlier code.",
+            file=sys.stderr,
+        )
 
 
 def _prepare(
@@ -294,6 +320,10 @@ def _resolve_request(req: RunRequest) -> RunRequest:
 
 
 def _reference_revision(req: RunRequest) -> str | None:
+    """The reference's pinned revision: the target's if they are the same model, else the
+    registry's; None if neither pins one (the reference step then records the commit)."""
+    if req.reference_id is None:
+        return None
     if req.reference_id == req.model_id:
         return req.revision
     return model_info(req.reference_id).revision
@@ -360,11 +390,13 @@ def _execute(run: _Run) -> RunRecord:
     target = run.step("scan_target", lambda: _scan_target_step(run, scan))
     if run.req.revision is None:  # pin later loads and the record to the commit just loaded
         run.req = replace(run.req, revision=target["commit"])
+    run.reference_revision = _reference_revision(run.req)
     skip = _reference_skip(run.req, scan)
     if skip:
         novelty = novelty_unavailable(skip, len(scan))
     else:
         ref = run.step("scan_reference", lambda: _scan_reference_step(run, scan))
+        run.reference_revision = run.reference_revision or ref["commit"]
         novelty = _novelty(run, target, ref)
     results["novelty"] = _novelty_summary(run, novelty, scan)
     results["exposure"] = _exposure(run, target)
@@ -425,7 +457,8 @@ def _contamination_step(run: _Run, scan: list[Example]) -> dict:
 
 
 def _scan_target_step(run: _Run, scan: list[Example]) -> dict:
-    seen, unseen, reason = _calibration_texts(run)
+    cal, reason = _calibration_texts(run)
+    seen, unseen = (cal.seen, cal.unseen) if cal else ([], [])
     texts = [e.prompt + "\n" + e.response for e in scan]
     with _loaded(run.req.model_id, run.req.revision, run.device) as (model, tok):
         return {
@@ -437,14 +470,30 @@ def _scan_target_step(run: _Run, scan: list[Example]) -> dict:
                 "reason": reason,
                 "seen": _min_k_scores(run, model, tok, seen),
                 "unseen": _min_k_scores(run, model, tok, unseen),
+                "set": _calibration_set(cal),
             },
         }
 
 
+def _calibration_set(cal: CalibrationSet | None) -> dict | None:
+    """What the calibration texts were: their hash, fetch date and counts."""
+    if cal is None:
+        return None
+    return {
+        "source": CALIBRATION_SOURCE,
+        "sha256": calibration_sha256(cal.seen, cal.unseen),
+        "fetched_on": cal.fetched_on,
+        "n_seen": len(cal.seen),
+        "n_unseen": len(cal.unseen),
+    }
+
+
 def _scan_reference_step(run: _Run, scan: list[Example]) -> dict:
     mismatched, true_index = mismatched_pairs(scan, run.profile.scan.mismatched_n, seed=SEED)
-    with _loaded(run.req.reference_id, _reference_revision(run.req), run.device) as (model, tok):
+    ref_id, revision = run.req.reference_id, _reference_revision(run.req)
+    with _loaded(ref_id, revision, run.device) as (model, tok):
         return {
+            "commit": _loaded_commit(ref_id, revision),
             "losses": _losses(run, model, tok, scan),
             "mismatched_losses": _losses(run, model, tok, mismatched),
             "mismatched_true_index": true_index,  # scan index of each pair's true pair
@@ -478,18 +527,18 @@ def _loaded_commit(model_id: str, revision: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-def _calibration_texts(run: _Run) -> tuple[list[str], list[str], str | None]:
-    """(seen, unseen, reason); the reason says why there are no calibration texts."""
+def _calibration_texts(run: _Run) -> tuple[CalibrationSet | None, str | None]:
+    """(texts, reason); the reason says why there are no calibration texts."""
     if run.req.unseen_after is None:
-        return [], [], NO_RELEASE_DATE
+        return None, NO_RELEASE_DATE
     cfg = run.profile.scan
     try:
-        seen, unseen = run.calibration_fetcher(
+        cal = run.calibration_fetcher(
             run.req.unseen_after, cfg.calibration_per_side, run.req.home / "calibration"
         )
     except CalibrationUnavailable as err:
-        return [], [], f"calibration unavailable: {err}"
-    return seen, unseen, None
+        return None, f"calibration unavailable: {err}"
+    return cal, None
 
 
 def _losses(run: _Run, model, tok, examples: list[Example]) -> list[float | None]:
@@ -571,7 +620,7 @@ def _novelty_summary(run: _Run, novelty: NoveltyResult, scan: list[Example]) -> 
     ref = run.req.reference_id
     return {
         **novelty.summary(),
-        "reference": None if ref is None else {"id": ref, "revision": _reference_revision(run.req)},
+        "reference": None if ref is None else {"id": ref, "revision": run.reference_revision},
         "examples": bucket_examples(novelty.labels, scan),
     }
 
@@ -579,11 +628,12 @@ def _novelty_summary(run: _Run, novelty: NoveltyResult, scan: list[Example]) -> 
 def _exposure(run: _Run, target: dict) -> dict:
     cal = target["calibration"]
     if cal["reason"]:
-        return asdict(exposure_inconclusive(cal["reason"]))
-    result = assess_exposure(
-        target["scores"], cal["seen"], cal["unseen"], min_auc=run.profile.scan.exposure_min_auc
-    )
-    return asdict(result)
+        result = exposure_inconclusive(cal["reason"])
+    else:
+        result = assess_exposure(
+            target["scores"], cal["seen"], cal["unseen"], min_auc=run.profile.scan.exposure_min_auc
+        )
+    return {**asdict(result), "calibration_set": cal.get("set")}
 
 
 def _arrays(correct: dict[str, list[bool]], names: list[str]) -> dict[str, np.ndarray]:
@@ -676,7 +726,7 @@ def _finish(run: _Run, status: str, results: dict, ds: dict, target: dict) -> Ru
             "fingerprint": ds["fingerprint"],
             "n_total": ds["n_total"],
             "n_scanned": len(ds["scan_lines"]),
-            "n_trained": len(ds["train_lines"]),
+            "n_trained": len(ds["train_lines"]) if status == "complete" else None,
             "declared_type": req.declared_type,
             "declared_date_range": _date_range(req),
         },
@@ -686,6 +736,7 @@ def _finish(run: _Run, status: str, results: dict, ds: dict, target: dict) -> Ru
             "params": target["n_params"],
             "family": model_info(req.model_id).family,
             "reference_id": req.reference_id,
+            "reference_revision": run.reference_revision,
             "unseen_after": req.unseen_after.isoformat() if req.unseen_after else None,
         },
         seeds=list(run.profile.seeds),
