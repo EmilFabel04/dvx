@@ -1,10 +1,8 @@
-import importlib.util
 import json
-import random
-from pathlib import Path
 
 import numpy as np
 import pytest
+from fixtures import medmcqa_sample
 
 from dvx.data import Example
 from dvx.models import REGISTRY
@@ -143,26 +141,6 @@ def test_bucket_examples_two_per_bucket_clipped():
     assert bucket_examples(["excluded"], exs[:1]) == {"known": [], "learnable": [], "noise": []}
 
 
-def _medmcqa_sample(n: int) -> list[Example]:
-    """n MedMCQA train rows (pinned revision, seed 0) in the sample script's format."""
-    from datasets import load_dataset
-
-    from dvx.evals.registry import get_suite
-
-    path = Path(__file__).resolve().parent.parent / "scripts" / "make_medmcqa_sample.py"
-    spec = importlib.util.spec_from_file_location("make_medmcqa_sample", path)
-    script = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(script)
-    bench = next(b for b in get_suite("medical-qa").benchmarks if b.name == "medmcqa")
-    rows = load_dataset(bench.hf_id, split="train", revision=bench.revision)
-    picked = sorted(random.Random(0).sample(range(len(rows)), n))
-    out = []
-    for line, i in enumerate(picked, start=1):
-        ex = script.medmcqa_row_to_example(rows[i])
-        out.append(Example(ex["prompt"], ex["response"], None, line))
-    return out
-
-
 @pytest.mark.slow
 @pytest.mark.parametrize("target", [m for m, info in REGISTRY.items() if info.reference_id])
 def test_registry_reference_has_lower_loss_than_its_target(target):
@@ -172,7 +150,7 @@ def test_registry_reference_has_lower_loss_than_its_target(target):
     from dvx.scan.losses import response_losses
 
     reference = REGISTRY[target].reference_id
-    sample = _medmcqa_sample(16)
+    sample = medmcqa_sample(16)
     mean = {}
     for model_id in (target, reference):
         model, tok = load_model(model_id, REGISTRY[model_id].revision, pick_device())

@@ -374,6 +374,20 @@ def test_scan_only(tmp_path, monkeypatch):
     assert len(read_corpus(req.home / "corpus.jsonl")) == 1
 
 
+def test_contamination_checks_the_whole_scan_sample(tmp_path, monkeypatch):
+    checked = []
+    real = pipeline.find_contamination
+
+    def spy_check(examples, items):
+        checked.append(len(examples))
+        return real(examples, items)
+
+    monkeypatch.setattr(pipeline, "find_contamination", spy_check)
+    profile = dataclasses.replace(PROFILE, measure_cap=10)  # train_cap 8
+    rec = run_scan(make_request(tmp_path), **overrides(profile_obj=profile))
+    assert checked == [rec.dataset["n_scanned"]] == [10]
+
+
 def test_sample_counts(tmp_path):
     req = make_request(tmp_path)
     rec = run_scan(req, **overrides(profile_obj=dataclasses.replace(PROFILE, measure_cap=10)))

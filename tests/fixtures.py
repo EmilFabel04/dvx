@@ -178,6 +178,32 @@ def _question(split: str, i: int) -> str:
     return f"In {split} case number {i}, which finding best fits {topic} in this patient"
 
 
+def medmcqa_sample(n: int) -> list:
+    """n MedMCQA train rows as dvx Examples, exactly as `scripts/make_medmcqa_sample.py
+    --n n --seed 0` writes them (Hub download; for slow tests)."""
+    import importlib.util
+    import random
+    from pathlib import Path
+
+    from datasets import load_dataset
+
+    from dvx.data import Example
+    from dvx.evals.registry import get_suite
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "make_medmcqa_sample.py"
+    spec = importlib.util.spec_from_file_location("make_medmcqa_sample", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    bench = next(b for b in get_suite("medical-qa").benchmarks if b.name == "medmcqa")
+    rows = load_dataset(bench.hf_id, split="train", revision=bench.revision)
+    picked = sorted(random.Random(0).sample(range(len(rows)), n))
+    out = []
+    for line, i in enumerate(picked, start=1):
+        ex = script.medmcqa_row_to_example(rows[i])
+        out.append(Example(ex["prompt"], ex["response"], None, line))
+    return out
+
+
 def benchmark_rows(name: str, split: str, n: int, questions: dict[int, str] | None = None) -> list:
     """`n` Hub-format rows for registry benchmark `name`, as `datasets` yields them for `split`.
 

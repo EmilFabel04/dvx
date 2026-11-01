@@ -347,7 +347,7 @@ def _execute(run: _Run) -> RunRecord:
     results = {
         "duplicates": _public(run.step("duplicates", lambda: _duplicates_step(run))),
         "contamination": _public(
-            run.step("contamination", lambda: _contamination_step(run, train))
+            run.step("contamination", lambda: _contamination_step(run, scan))
         ),
     }
     target = run.step("scan_target", lambda: _scan_target_step(run, scan))
@@ -411,9 +411,10 @@ def _duplicates_step(run: _Run) -> dict:
     return asdict(stats)
 
 
-def _contamination_step(run: _Run, train: list[Example]) -> dict:
+def _contamination_step(run: _Run, scan: list[Example]) -> dict:
+    """Checks the whole scan sample (up to measure_cap), which contains the train sample."""
     items = [item for b in run.suite.benchmarks for item in run.items[b.name]]
-    return asdict(find_contamination(train, items))
+    return asdict(find_contamination(scan, items))
 
 
 def _scan_target_step(run: _Run, scan: list[Example]) -> dict:
