@@ -57,7 +57,7 @@ Formula: 19 x mean(tuned_s0, control_s0) + scan_target + scan_reference + eval_b
 - mean(1,236.7, 1,270.1) = 1,253.4 s
 - 19 x 1,253.397 (unrounded mean) = 23,814.5 s
 - plus 220.0 + 206.4 + 97.8 = 524.2 s
-- Total = 24,338.7 s = **about 6.8 hours**
+- Total = 24,338.8 s (from unrounded values) = **about 6.8 hours**
 
 Each fine-tune step already includes its own eval. This is an upper bound if M2's
 scaling-curve fine-tunes use fewer examples than the 2,000 used here.
