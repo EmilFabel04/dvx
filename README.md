@@ -30,6 +30,14 @@ Every run also writes a structured record to a local **corpus** of "data about d
 - Open models of about 0.5–3B parameters on a laptop (Apple Silicon via PyTorch MPS), with validation on about 8B models via CUDA.
 - A CLI and a Python library. Dollar values are explicitly out of scope for v1.
 
+## Development
+
+```bash
+uv sync --extra dev
+uv run pytest
+uv run ruff check .
+```
+
 ## License
 
 [Apache-2.0](LICENSE)

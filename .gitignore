@@ -7,7 +7,6 @@ build/
 dist/
 .venv/
 venv/
-.python-version
 
 # Tooling caches
 .pytest_cache/
@@ -38,3 +37,6 @@ hf_cache/
 # dvx local outputs: run artifacts, reports, and the local corpus store
 .dvx/
 runs/
+
+# Local datasets
+data/
