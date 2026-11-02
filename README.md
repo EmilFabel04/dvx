@@ -106,10 +106,11 @@ There is no price or currency output.
 - **Uncertainty.** The quick profile trains **one seed**. Its confidence intervals cover question sampling only, not training randomness, so treat a small gain with a narrow interval with care.
 - **Reproducibility.** Each record pins what a third party needs to rerun the measurement: the dataset content hash, model and reference revisions, the eval suite version (which pins benchmark revisions) and shot IDs, seeds, library versions, the dvx version and source commit (with a dirty flag), the calibration texts' SHA-256 and fetch date, and the hardware. Reruns are not bit-identical, though. Training and scoring on Apple GPUs (MPS) are not deterministic, the calibration texts are re-fetched from a changing Wikipedia unless the cache is kept, and a different device or library version can move the numbers. Compare reruns by their confidence intervals, not their digits.
 - **Small models.** A result for a 1.7B model is not evidence about an 8B model.
+- **Novelty buckets.** In M1 the noise threshold compares absolute loss, so long responses lean toward "noise". Treat the known/learnable/noise mix as indicative; the gate's reliability numbers say whether the reference model is usable, not whether the bucket boundaries are right. Milestone 2 redesigns the rule.
 
 ## Running on a 16 GB Apple Silicon Mac
 
-dvx runs on MPS, CUDA and CPU from one codebase, loads one model at a time, and bounds scoring and training memory. Measured wall times and memory for a quick run on an M5 with 16 GB are in [`docs/timings-m5.md`](docs/timings-m5.md). That first measurement predates the 5-shot evaluation, which makes each eval pass several times longer, and will be updated after the next run. One-time costs include downloading the models and fetching the Wikipedia calibration texts (about 20 minutes the first time).
+dvx runs on MPS, CUDA and CPU from one codebase, loads one model at a time, and bounds scoring and training memory. Measured wall times and memory for a quick run on an M5 with 16 GB are in [`docs/timings-m5.md`](docs/timings-m5.md). A quick run with Qwen3-1.7B-Base took 8,011 s of step wall time (2 h 13 min), and the highest process footprint sampled every 30 s was about 10 GB. One-time costs include downloading the models and fetching the Wikipedia calibration texts (about 20 minutes the first time).
 
 ## Licenses
 
