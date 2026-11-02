@@ -110,7 +110,7 @@ There is no price or currency output.
 
 ## Running on a 16 GB Apple Silicon Mac
 
-dvx runs on MPS, CUDA and CPU from one codebase, loads one model at a time, and bounds scoring and training memory. Measured wall times and memory for a quick run on an M5 with 16 GB are in [`docs/timings-m5.md`](docs/timings-m5.md). A quick run with Qwen3-1.7B-Base took 8,011 s of step wall time (2 h 13 min), and the highest process footprint sampled every 30 s was 10,240 MB. One-time costs include downloading the models and fetching the Wikipedia calibration texts (about 20 minutes the first time).
+dvx runs on MPS, CUDA and CPU from one codebase, loads one model at a time, and bounds scoring and training memory. Measured wall times and memory for a quick run on an M5 with 16 GB are in [`docs/timings-m5.md`](docs/timings-m5.md). A quick run with Qwen3-1.7B-Base took 8,011 s of step wall time (2 h 13 min), and the highest process footprint sampled every 30 s was about 10 GB. One-time costs include downloading the models and fetching the Wikipedia calibration texts (about 20 minutes the first time).
 
 ## Licenses
 

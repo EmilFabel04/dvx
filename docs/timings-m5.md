@@ -9,9 +9,10 @@ truncated: 0. Engine commit: `a7e8d36` (clean, `env.dvx_dirty` is false). Run: `
 Training examples truncated to 512 tokens: 71 in the tuned arm, 115 in the control arm.
 
 Total wall time 8,011 s (2 h 13 min 31 s): the sum of the step walls in `record.json`
-(`compute.steps`), rounded once. Process wall time from the log's start timestamp (01:37:33) to
-the watchdog's observation that the process was gone (03:51:48) is about 8,055 s (2 h 14 min),
-approximate to within 35 s (30 s polling plus 5 s grace). There was no `/usr/bin/time` for this run.
+(`compute.steps`), rounded once. Process wall time from the log's start timestamp (01:37:33) is
+about 8,042–8,055 s (2 h 14 min): `record.json`, the last file a run writes, is dated 03:51:35,
+and the watchdog (30 s polling plus 5 s grace) saw the process gone at 03:51:48. There was no
+`/usr/bin/time` for this run.
 All Hub downloads and the calibration set were already cached.
 
 ## Wall time per step (`record.json`, `compute.steps`)
@@ -46,9 +47,10 @@ not measured.
 
 What was measured, and how:
 
-- A watchdog sampled the Python process footprint every 30 s. The highest sample was
-  10,240 MB, taken at 01:45:20, about a minute into scan_reference (the 4B reference model).
-  A spike shorter than 30 s could be missed.
+- A watchdog sampled the Python process footprint every 30 s with macOS `footprint`. The
+  highest sample, taken at 01:45:20, under a minute into scan_reference (the 4B reference
+  model), read 10 GB. At that size `footprint` printed GB rather than MB, so the reading is
+  coarser than the MB spot checks below. A spike shorter than 30 s could be missed.
 - Two controller spot checks, not logged to a file: during tuned_s0 training, footprint
   6,714 MB and GPU device utilization 99%; during control_s0, about 40 min in, footprint
   8,796 MB and GPU 88%.
@@ -92,7 +94,7 @@ about 15% lower (16.9 / 20 = 0.85).
 
 - **The 5-shot eval removed the format inflation.** The format effect (control - base) is
   +0.5 / -0.7 / +0.2 pp for target / adjacent / side_effect, all with CIs that include zero. The
-  first run's raw gains were +6.0 / +18.0 / +16.5 pp, mostly format learning. The control arm
+  first run's raw gains were +6.0 / +18.0 / +16.5 pp, likely mostly format learning. The control arm
   is still worth keeping as a check, but it no longer dominates.
 - **A quick fine-tune on these 2,000 MedMCQA examples does not measurably move 1.7B-Base on
   medical QA.** Data-specific target +0.9 pp, CI -0.6 to +2.2, which includes zero. In-domain
