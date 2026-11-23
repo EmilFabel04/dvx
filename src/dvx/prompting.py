@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from dvx.data import Example
+from dvx.evals.registry import MCQItem
 
 IGNORE = -100
 MIN_MAX_LEN = 8
@@ -17,6 +18,12 @@ class EncodedExample:
     truncated: bool
 
 
+def _apply_chat(tokenizer: PreTrainedTokenizerBase, msgs: list[dict[str, str]]) -> str:
+    return tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
+
+
 def render_prompt(
     tokenizer: PreTrainedTokenizerBase, prompt: str, system: str | None = None
 ) -> str:
@@ -24,9 +31,7 @@ def render_prompt(
         msgs = ([{"role": "system", "content": system}] if system else []) + [
             {"role": "user", "content": prompt}
         ]
-        return tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
-        )
+        return _apply_chat(tokenizer, msgs)
     prefix = f"{system}\n\n" if system else ""
     return f"{prefix}### Question:\n{prompt}\n\n### Answer:\n"
 
@@ -41,8 +46,8 @@ def _adds_bos(tokenizer: PreTrainedTokenizerBase, text: str) -> bool:
     return bool(with_special) and with_special[0] == bos and not (plain and plain[0] == bos)
 
 
-def _prompt_ids(tokenizer: PreTrainedTokenizerBase, ex: Example) -> list[int]:
-    text = render_prompt(tokenizer, ex.prompt, ex.system)
+def encode_prompt_text(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
+    """Token ids for rendered prompt text, exactly as SFT encodes a prompt."""
     ids = tokenizer(text, add_special_tokens=False).input_ids
     # Chat templates already emit their own special tokens; on the plain path
     # add BOS only if the tokenizer would add it itself.
@@ -51,10 +56,18 @@ def _prompt_ids(tokenizer: PreTrainedTokenizerBase, ex: Example) -> list[int]:
     return ids
 
 
+def render_mcq(tokenizer: PreTrainedTokenizerBase, item: MCQItem) -> str:
+    options = "\n".join(f"{chr(ord('A') + i)}. {opt}" for i, opt in enumerate(item.options))
+    content = f"{item.question}\n\n{options}\n\nAnswer with the letter of the correct option."
+    if tokenizer.chat_template:
+        return _apply_chat(tokenizer, [{"role": "user", "content": content}])
+    return f"{content}\nAnswer:"
+
+
 def encode_sft(tokenizer: PreTrainedTokenizerBase, ex: Example, max_len: int) -> EncodedExample:
     if max_len < MIN_MAX_LEN:
         raise ValueError(f"max_len must be at least {MIN_MAX_LEN}, got {max_len}")
-    prompt = _prompt_ids(tokenizer, ex)
+    prompt = encode_prompt_text(tokenizer, render_prompt(tokenizer, ex.prompt, ex.system))
     response = [
         *tokenizer(ex.response, add_special_tokens=False).input_ids,
         tokenizer.eos_token_id,
